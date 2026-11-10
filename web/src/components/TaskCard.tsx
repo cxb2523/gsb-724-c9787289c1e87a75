@@ -1,0 +1,375 @@
+import { useDraggable } from "@dnd-kit/core";
+import type { EnrichedSessionLink, EnrichedTask } from "@shared/board-schema";
+import { useEffect, useState } from "react";
+import type { JSX } from "react";
+
+import { FinishedMark } from "./AttentionMarks";
+import { CloseSessionModal } from "./CloseSessionModal";
+import { RestoreSessionModal } from "./RestoreSessionModal";
+import { api } from "../lib/api";
+import { newSince, readLogSeen, seenKey } from "../lib/log-seen";
+import { CLOSING_STATUS, RESUMING_STATUS } from "../lib/optimistic";
+import { TONE_DOT, isLiveLink, sessionLinkKey, sessionStateLabel, sessionStateTone } from "../lib/session-state";
+import { foldable, sessionItems } from "../lib/session-tree";
+import type { SessionItem } from "../lib/session-tree";
+import { relativeTime } from "../lib/time";
+
+const PRIORITY_STYLE: Record<string, string> = {
+  p0: "bg-red-900/60 text-red-300 light:bg-red-100 light:text-red-700",
+  p1: "bg-orange-900/60 text-orange-300 light:bg-orange-100 light:text-orange-700",
+  p2: "bg-yellow-900/60 text-yellow-300 light:bg-yellow-100 light:text-yellow-800",
+  p3: "bg-slate-700 text-slate-300 light:bg-slate-200 light:text-slate-700",
+};
+const PRIORITY_LABEL: Record<string, string> = { p0: "P0", p1: "P1", p2: "P2", p3: "P3" };
+
+interface Props {
+  readonly task: EnrichedTask;
+  readonly boardId: string;
+  readonly onEdit: () => void;
+  readonly onOpenLog: () => void;
+  readonly onOpenSession: (env: string, paneId: string, awaitAgent?: boolean, title?: string) => void;
+  readonly onDetachSession: (env: string, paneId: string, sessionId: string | null) => void;
+  readonly onCloseSession: (env: string, paneId: string, sessionId: string | null) => Promise<void>;
+  readonly onResumeSession: (env: string, paneId: string, sessionId: string | null) => void;
+}
+
+export function TaskCard({ task, boardId, onEdit, onOpenLog, onOpenSession, onDetachSession, onCloseSession, onResumeSession }: Props): JSX.Element {
+  // Opening a session always uses awaitAgent=false (attach once). Retry-until-registered is only for
+  // the post-spawn auto-open (TaskEditModal); a manual reopen of a LIVE session attaches immediately,
+  // and a manual open of a DEAD one should fail fast with a clear message — not spin "starting…" for
+  // 25s against a pane that's gone. The card body opens the PRIMARY session (live-first); each session
+  // row opens that specific one; the ⚙ always edits. With no session, the body falls to edit.
+  const liveSession = task.sessions.find(isLiveLink);
+  const primary = liveSession ?? task.sessions[0];
+  // Safety net against a server-side link bug (a spawn/attach race can persist two links resolving to
+  // the same live session): collapse duplicates before rendering. Same key as the column marker's
+  // count, so the two can never disagree about how many sessions a card holds.
+  const seenSessionKeys = new Set<string>();
+  const dedupedSessions = task.sessions.filter((s) => {
+    const key = sessionLinkKey(s);
+    if (seenSessionKeys.has(key)) return false;
+    seenSessionKeys.add(key);
+    return true;
+  });
+  const [showClosed, setShowClosed] = useState(false);
+  const canFold = foldable(dedupedSessions);
+  const items = sessionItems(dedupedSessions, !showClosed);
+  const rowHandlers = { title: task.title, onOpenSession, onCloseSession, onResumeSession, onDetachSession };
+  const handleCardClick = (): void => {
+    if (primary !== undefined) onOpenSession(primary.env, primary.paneId, false, task.title);
+    else onEdit();
+  };
+  const { setNodeRef, attributes, listeners, isDragging } = useDraggable({
+    id: `task-drag:${task.id}`,
+    data: { type: "task", taskId: task.id },
+  });
+
+  return (
+    <div
+      ref={setNodeRef}
+      onClick={handleCardClick}
+      {...listeners}
+      {...attributes}
+      className={`bg-card border border-border rounded-lg p-3 cursor-pointer hover:border-primary transition-colors ${isDragging ? "opacity-40" : ""}`}
+    >
+      <div className="flex items-start justify-between gap-2 mb-2">
+        <span className="text-foreground text-sm font-medium leading-snug">{task.title}</span>
+        <div className="flex items-center gap-1.5 shrink-0">
+          {task.priority !== null && (
+            <span className={`text-xs px-1.5 py-0.5 rounded font-mono ${PRIORITY_STYLE[task.priority] ?? ""}`}>
+              {PRIORITY_LABEL[task.priority] ?? task.priority}
+            </span>
+          )}
+          <button
+            type="button"
+            onPointerDown={(e) => { e.stopPropagation(); }}
+            onClick={(e) => { e.stopPropagation(); onEdit(); }}
+            className="text-muted-foreground hover:text-foreground text-base leading-none p-1 -m-1"
+            title="Edit task"
+          >⚙</button>
+        </div>
+      </div>
+      <LogBadge task={task} boardId={boardId} onOpenLog={onOpenLog} />
+      {dedupedSessions.length > 0 && (
+        <div className="flex flex-col gap-1 mt-2">
+          <SessionItems items={items} rowHandlers={rowHandlers} onExpand={() => { setShowClosed(true); }} />
+          {canFold && showClosed && (
+            <button
+              type="button"
+              onPointerDown={(e) => { e.stopPropagation(); }}
+              onClick={(e) => { e.stopPropagation(); setShowClosed(false); }}
+              className="self-start text-muted-foreground/60 hover:text-foreground text-xs leading-none px-1 py-0.5"
+              title="Hide closed sessions"
+              aria-label="Hide closed sessions"
+            >⌃</button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const RING = "w-2 h-2 rounded-full shrink-0 border border-slate-500";
+const MAX_RINGS = 7;
+
+type RowHandlers = Omit<SessionRowProps, "s">;
+
+function SessionItems({ items, rowHandlers, onExpand }: {
+  readonly items: readonly SessionItem<EnrichedSessionLink>[];
+  readonly rowHandlers: RowHandlers;
+  readonly onExpand: () => void;
+}): JSX.Element {
+  return (
+    <>
+      {items.map((item) => {
+        if (item.kind === "folded") {
+          const label = `${String(item.links.length)} closed — click to show`;
+          const extra = item.links.length - MAX_RINGS;
+          return (
+            <button
+              key={`folded:${item.links.map(sessionLinkKey).join("|")}`}
+              type="button"
+              onPointerDown={(e) => { e.stopPropagation(); }}
+              onClick={(e) => { e.stopPropagation(); onExpand(); }}
+              className="self-start flex items-center gap-0.5 -mx-1 px-1 py-1 rounded hover:bg-muted"
+              title={label}
+              aria-label={label}
+            >
+              {item.links.slice(0, MAX_RINGS).map((l) => <span key={sessionLinkKey(l)} className={RING} />)}
+              {extra > 0 && <span className="ml-1 text-[10px] text-muted-foreground">+{extra}</span>}
+            </button>
+          );
+        }
+        // Key includes sessionId: after churn-heal two links can share an enriched paneId (one
+        // live at the reused pane, one detached still pointing at it), but their sessionIds differ.
+        return (
+          <div key={sessionLinkKey(item.link)} className="flex flex-col gap-1">
+            <SessionRow s={item.link} {...rowHandlers} />
+            {item.children.length > 0 && (
+              <div className="flex flex-col gap-1 ml-1 pl-2 border-l border-border">
+                <SessionItems items={item.children} rowHandlers={rowHandlers} onExpand={onExpand} />
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
+const LOG_ICON_PATH = "M3 4h10M3 8h10M3 12h6";
+
+/**
+ * Three states: new entries this browser has not displayed (accent, "N new"), a quiet log (muted
+ * count), and a card with a session but no NOTE yet (warning — the card-signal case; `logCount`
+ * cannot tell, every card carries lifecycle entries from birth). "New" is per viewer and derived
+ * from the counters on the frame (log-seen.ts): the server holds no seen notion. A card with no
+ * session and no log shows nothing — there is nobody to have written.
+ */
+function LogBadge({ task, boardId, onOpenLog }: {
+  readonly task: EnrichedTask;
+  readonly boardId: string;
+  readonly onOpenLog: () => void;
+}): JSX.Element | null {
+  const silent = task.noteCount === 0 && task.sessions.length > 0;
+  if (task.logCount === 0 && !silent) return null;
+  const fresh = newSince(task, readLogSeen(seenKey(boardId, task.id)));
+  const tone = silent ? "text-warning" : fresh > 0 ? "text-primary" : "text-muted-foreground/55";
+  return (
+    <button
+      type="button"
+      onPointerDown={(e) => { e.stopPropagation(); }}
+      onClick={(e) => { e.stopPropagation(); onOpenLog(); }}
+      className={`flex items-center gap-1.5 mb-2 -mx-1 px-1 rounded hover:bg-muted ${tone}`}
+      title={silent ? "This card's sessions have written no note to its log yet" : "Open the card's log"}
+      data-testid="log-badge"
+    >
+      <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" aria-hidden="true">
+        <path d={LOG_ICON_PATH} />
+      </svg>
+      {silent
+        ? <span className="text-[11px]">nothing written</span>
+        : (
+          <>
+            <span className="font-mono text-[11px]">{task.logCount}</span>
+            {fresh > 0 && (
+              <>
+                <span className="w-[5px] h-[5px] rounded-full bg-current" aria-hidden="true" />
+                <span className="text-[11px] opacity-80">{fresh} new</span>
+              </>
+            )}
+          </>
+        )}
+    </button>
+  );
+}
+
+interface SessionRowProps {
+  readonly s: EnrichedSessionLink;
+  readonly title: string;
+  readonly onOpenSession: (env: string, paneId: string, awaitAgent?: boolean, title?: string) => void;
+  readonly onCloseSession: (env: string, paneId: string, sessionId: string | null) => Promise<void>;
+  readonly onResumeSession: (env: string, paneId: string, sessionId: string | null) => void;
+  readonly onDetachSession: (env: string, paneId: string, sessionId: string | null) => void;
+}
+
+function SessionRow({ s, title, onOpenSession, onCloseSession, onResumeSession, onDetachSession }: SessionRowProps): JSX.Element {
+  const detached = s.live?.detached === true;
+  // Optimistic transient (App overlays a synthetic live.status during a close/resume round-trip). While
+  // pending we suppress every row action + the click behavior so item 1 and item 2 can't fight — e.g. the
+  // synthetic "closing" sets detached:true, which would otherwise re-arm Restore on a session being killed.
+  const isClosing = s.live?.status === CLOSING_STATUS;
+  const pending = isClosing || s.live?.status === RESUMING_STATUS;
+  const resumable = detached && !pending && s.sessionId !== null && s.sessionId !== "";
+  const [lastActive, setLastActive] = useState<number | null>(null);
+  const [confirming, setConfirming] = useState(false); // inline Detach/Remove confirm
+  const [showRestore, setShowRestore] = useState(false);
+  const [showClose, setShowClose] = useState(false);
+
+  useEffect(() => {
+    if (!resumable || s.sessionId === null) { setLastActive(null); return; }
+    let cancelled = false;
+    api.sessions.lastActive(s.env, s.sessionId)
+      .then((r) => { if (!cancelled) setLastActive(r.lastActive); })
+      .catch(() => { if (!cancelled) setLastActive(null); });
+    return () => { cancelled = true; };
+  }, [resumable, s.env, s.sessionId]);
+
+  const stop = (e: { stopPropagation: () => void }): void => { e.stopPropagation(); };
+  const shortId = s.sessionId !== null && s.sessionId !== "" ? s.sessionId.slice(0, 8) : null;
+  // The ✕ hits the same detach route for both states but MEANS different things: unlink a still-running
+  // session (returns to Unassigned) vs delete an already-dead one. Label + warning make that explicit.
+  const removeVerb = detached ? "Remove" : "Detach";
+  const removeWarning = detached
+    ? "Removes this closed session permanently"
+    : "Detaches — leaves it running, returns to Unassigned";
+
+  function handleOpen(): void {
+    if (pending) return; // mid close/resume — ignore until it reconciles
+    if (detached) { setShowRestore(true); return; } // never attach to a dead pane; offer restore instead
+    onOpenSession(s.env, s.paneId, false, title);
+  }
+
+  return (
+    <div className="flex items-center gap-1 group/session -mx-1 px-1 rounded hover:bg-muted">
+      <button
+        type="button"
+        onPointerDown={stop}
+        onClick={(e) => { stop(e); handleOpen(); }}
+        className="flex items-center gap-1.5 flex-1 min-w-0 text-left py-0.5"
+        title={pending ? (isClosing ? "Closing…" : "Resuming…") : detached ? "Session ended — click to restore" : "Open this session"}
+      >
+        <span className={detached ? RING : `w-2 h-2 rounded-full shrink-0 ${TONE_DOT[sessionStateTone(s.live)]}`} />
+        <span className="text-xs truncate">
+          {detached ? (
+            <span className="text-muted-foreground">
+              {s.name}
+              {isClosing
+                ? <span className="text-muted-foreground/70"> · closing…</span>
+                : lastActive !== null && <span className="text-muted-foreground/70"> · last active {relativeTime(lastActive)}</span>}
+            </span>
+          ) : (
+            <>
+              <span className="text-muted-foreground">{sessionStateLabel(s.live)}</span>
+              {s.name !== "" && (
+                // The session's own name, not the herdr tab label: a `/rename` reaches the registry in
+                // seconds but the tab only on the next sweep, and the two can diverge for good on a
+                // session corral did not spawn. server/api.ts resolves which string that is and
+                // guarantees it non-empty; the guard stays only to match the detached branch's shape.
+                // Workspace/repo label intentionally omitted here — it lives in the terminal header now.
+                <span className="text-muted-foreground/70"> · {s.name}</span>
+              )}
+            </>
+          )}
+        </span>
+        {!detached && <FinishedMark sessionKey={`${s.env}:${s.paneId}`} />}
+      </button>
+      {shortId !== null && (
+        <button
+          type="button"
+          onPointerDown={stop}
+          onClick={(e) => { stop(e); void navigator.clipboard.writeText(s.sessionId ?? ""); }}
+          className="shrink-0 font-mono text-[10px] text-muted-foreground/40 hover:text-muted-foreground p-1"
+          title={`Claude session ${s.sessionId ?? ""} — click to copy`}
+        >{shortId}</button>
+      )}
+      {!pending && (confirming ? (
+        <div className="shrink-0 flex items-center gap-1">
+          <span className="text-[10px] text-muted-foreground" title={removeWarning}>{removeVerb}?</span>
+          <button
+            type="button"
+            onPointerDown={stop}
+            onClick={(e) => { stop(e); onDetachSession(s.env, s.paneId, s.sessionId); }}
+            className="text-red-400/80 hover:text-red-400 text-xs leading-none p-1"
+            title={removeWarning}
+            aria-label={`Confirm ${removeVerb.toLowerCase()} session`}
+          >✓</button>
+          <button
+            type="button"
+            onPointerDown={stop}
+            onClick={(e) => { stop(e); setConfirming(false); }}
+            className="text-muted-foreground/60 hover:text-foreground text-xs leading-none p-1"
+            title="Cancel"
+            aria-label="Cancel"
+          >✕</button>
+        </div>
+      ) : (
+        <>
+          {resumable && (
+            <button
+              type="button"
+              onPointerDown={stop}
+              onClick={(e) => { stop(e); onResumeSession(s.env, s.paneId, s.sessionId); }}
+              className="shrink-0 text-muted-foreground/40 hover:text-emerald-400 text-xs leading-none p-1 opacity-0 group-hover/session:opacity-100 transition-opacity"
+              title="Restore this session (claude --resume)"
+              aria-label="Restore session"
+            >⟲</button>
+          )}
+          {!detached && (
+            <button
+              type="button"
+              onPointerDown={stop}
+              onClick={(e) => { stop(e); setShowClose(true); }}
+              className="shrink-0 text-muted-foreground/40 hover:text-orange-400 text-xs leading-none p-1 opacity-0 group-hover/session:opacity-100 transition-opacity"
+              title="Close (kill) this session"
+              aria-label="Close session"
+            >⊗</button>
+          )}
+          <button
+            type="button"
+            onPointerDown={stop}
+            onClick={(e) => { stop(e); setConfirming(true); }}
+            className="shrink-0 text-muted-foreground/40 hover:text-red-400 text-xs leading-none p-1 opacity-0 group-hover/session:opacity-100 transition-opacity"
+            title={detached ? "Remove this closed session (permanent)" : "Detach this session (keeps it running)"}
+            aria-label={`${removeVerb} session`}
+          >✕</button>
+        </>
+      ))}
+      {showRestore && (
+        <RestoreSessionModal
+          name={s.name}
+          sessionId={s.sessionId}
+          lastActive={lastActive}
+          resumable={resumable}
+          onRestore={() => { onResumeSession(s.env, s.paneId, s.sessionId); }}
+          onClose={() => { setShowRestore(false); }}
+        />
+      )}
+      {showClose && (
+        <CloseSessionModal
+          name={s.name}
+          taskTitle={title}
+          env={s.env}
+          paneId={s.paneId}
+          tabId={s.tabId}
+          sessionId={s.sessionId}
+          status={s.live?.status ?? "unknown"}
+          model={s.live?.model ?? null}
+          ctxPct={s.live?.ctxPct ?? null}
+          onClose={() => onCloseSession(s.env, s.paneId, s.sessionId)}
+          onDismiss={() => { setShowClose(false); }}
+        />
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,152 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { describe, it, expect, afterEach, vi } from "vitest";
+
+import {
+  ATTENTION_MIN_WORK_MS, BOARD_DATA_DIR, BRIEF_ROOT, CHEAP_INTERVAL_MS, CORRAL_HOME,
+  FOCUS_TRANSLATION_ENABLED, intFromEnv,
+  LIST_TIMEOUT, RECAP_ENABLED, RECAP_INTERVAL_MS, RECAP_TAIL_BYTES,
+  RECAP_READ_TIMEOUT_MS, RECAP_CONTENT_MAX, REMOTE_PROBE_ENABLED,
+  TAB_RENAME_ENABLED, UPDATE_CHECK_ENABLED, ZOMBIE_REAP_GRACE_MS,
+} from "../config.ts";
+import { CACHE_DIR } from "../server/diagnostics/update/cache.ts";
+import { resolveReapGrace } from "../server/preflight.ts";
+
+describe("intFromEnv", () => {
+  const KEY = "CORRAL_TEST_INT_ENV"; // static property below → avoids no-dynamic-delete
+  afterEach(() => { delete process.env.CORRAL_TEST_INT_ENV; });
+
+  it("returns the fallback when the var is unset", () => {
+    expect(intFromEnv(KEY, 42)).toBe(42);
+  });
+  it("parses a valid integer", () => {
+    process.env.CORRAL_TEST_INT_ENV = "123";
+    expect(intFromEnv(KEY, 42)).toBe(123);
+  });
+  it("rejects empty/whitespace input (the Number('')===0 footgun) → fallback", () => {
+    process.env.CORRAL_TEST_INT_ENV = "";
+    expect(intFromEnv(KEY, 8787, { min: 1 })).toBe(8787);
+    process.env.CORRAL_TEST_INT_ENV = "   ";
+    expect(intFromEnv(KEY, 8787, { min: 1 })).toBe(8787);
+  });
+  it("rejects non-integer input → fallback", () => {
+    process.env.CORRAL_TEST_INT_ENV = "abc";
+    expect(intFromEnv(KEY, 42)).toBe(42);
+    process.env.CORRAL_TEST_INT_ENV = "1.5";
+    expect(intFromEnv(KEY, 42)).toBe(42);
+  });
+  it("rejects a value below min → fallback", () => {
+    process.env.CORRAL_TEST_INT_ENV = "0";
+    expect(intFromEnv(KEY, 8787, { min: 1 })).toBe(8787);
+  });
+  it("accepts a negative integer when no min is set", () => {
+    process.env.CORRAL_TEST_INT_ENV = "-5";
+    expect(intFromEnv(KEY, 42)).toBe(-5);
+  });
+});
+
+describe("RECAP config defaults", () => {
+  it("RECAP_ENABLED defaults to true", () => { expect(RECAP_ENABLED).toBe(true); });
+  it("RECAP_INTERVAL_MS defaults to 60000", () => { expect(RECAP_INTERVAL_MS).toBe(60000); });
+  it("RECAP_TAIL_BYTES defaults to 262144", () => { expect(RECAP_TAIL_BYTES).toBe(262144); });
+  it("RECAP_READ_TIMEOUT_MS defaults to 8000", () => { expect(RECAP_READ_TIMEOUT_MS).toBe(8000); });
+  it("RECAP_CONTENT_MAX defaults to 4096", () => { expect(RECAP_CONTENT_MAX).toBe(4096); });
+});
+
+describe("poll + attention config defaults", () => {
+  it("CHEAP_INTERVAL_MS defaults to 30000 (durable, not instant)", () => { expect(CHEAP_INTERVAL_MS).toBe(30000); });
+  it("ATTENTION_MIN_WORK_MS defaults to 600000 (10 min)", () => { expect(ATTENTION_MIN_WORK_MS).toBe(600000); });
+});
+
+describe("TAB_RENAME_ENABLED", () => {
+  it("defaults to true when the env var is unset", () => {
+    // The test runner does not set TAB_RENAME_ENABLED, so the imported default must be true.
+    expect(TAB_RENAME_ENABLED).toBe(true);
+  });
+});
+
+describe("FOCUS_TRANSLATION_ENABLED", () => {
+  it("defaults to true when the env var is unset", () => {
+    expect(FOCUS_TRANSLATION_ENABLED).toBe(true);
+  });
+});
+
+describe("AMBIENT_HERDR_SOCKET", () => {
+  // A session running this suite may itself sit inside a real herdr pane with HERDR_SOCKET_PATH
+  // set, so the module-level export can't be asserted directly — reimport with the var cleared.
+  const original = process.env.HERDR_SOCKET_PATH;
+  afterEach(() => {
+    if (original === undefined) delete process.env.HERDR_SOCKET_PATH;
+    else process.env.HERDR_SOCKET_PATH = original;
+  });
+
+  it("defaults to null when HERDR_SOCKET_PATH is unset", async () => {
+    delete process.env.HERDR_SOCKET_PATH;
+    vi.resetModules();
+    const fresh = await import("../config.ts");
+    // server/whoami.ts's effectiveSocket() relies on this default to refuse an unmatched socket
+    // hint rather than silently accepting one.
+    expect(fresh.AMBIENT_HERDR_SOCKET).toBeNull();
+  });
+
+  it("passes through a set HERDR_SOCKET_PATH", async () => {
+    process.env.HERDR_SOCKET_PATH = "/repo/path/to/herdr.sock";
+    vi.resetModules();
+    const fresh = await import("../config.ts");
+    expect(fresh.AMBIENT_HERDR_SOCKET).toBe("/repo/path/to/herdr.sock");
+  });
+});
+
+describe("BRIEF_ROOT", () => {
+  // Regression guard: BRIEF_ROOT used to live under CORRAL_HOME, which BOARD_DATA_DIR defaults to and
+  // which server/git.ts `git add -A`s on an interval — a spawn brief written there gets permanently
+  // committed to the board-data repo's history. It MUST live outside both, like UPLOAD_ROOT.
+  it("does not live inside CORRAL_HOME", () => {
+    expect(BRIEF_ROOT.startsWith(CORRAL_HOME)).toBe(false);
+  });
+  it("does not live inside BOARD_DATA_DIR (what server/git.ts actually commits)", () => {
+    expect(BRIEF_ROOT.startsWith(BOARD_DATA_DIR)).toBe(false);
+  });
+});
+
+describe("REMOTE_PROBE_ENABLED", () => {
+  it("REMOTE_PROBE_ENABLED defaults on", () => {
+    expect(REMOTE_PROBE_ENABLED).toBe(true);
+  });
+
+  it("REMOTE_PROBE_ENABLED is declared in the house spelling — !== \"false\", never === \"off\"", () => {
+    // The design's complaint was the `=off` spelling: an operator following the house convention
+    // writes =false, and under an exact === "off" test egress would stay ON with no warning.
+    const src = readFileSync(path.join(import.meta.dirname, "..", "config.ts"), "utf8");
+    expect(src).toMatch(/REMOTE_PROBE_ENABLED = process\.env\.REMOTE_PROBE_ENABLED !== "false"/);
+  });
+});
+
+describe("UPDATE_CHECK_ENABLED", () => {
+  it("UPDATE_CHECK_ENABLED defaults on", () => {
+    expect(UPDATE_CHECK_ENABLED).toBe(true);
+  });
+
+  it("UPDATE_CHECK_ENABLED is declared in the house spelling — !== \"false\", never === \"off\"", () => {
+    // Same reasoning as the switch above, and it matters more here: this is the knob whose entire
+    // purpose is stopping an outbound HTTP request.
+    const src = readFileSync(path.join(import.meta.dirname, "..", "config.ts"), "utf8");
+    expect(src).toMatch(/UPDATE_CHECK_ENABLED = process\.env\.UPDATE_CHECK_ENABLED !== "false"/);
+  });
+});
+
+describe("the update-check cache directory", () => {
+  it("does not live inside BOARD_DATA_DIR — server/git.ts commits that tree every 10 s", () => {
+    expect(CACHE_DIR.startsWith(BOARD_DATA_DIR)).toBe(false);
+  });
+});
+
+describe("shipped reaper defaults", () => {
+  it("clear their own floor, so a default install never needs the startup clamp", () => {
+    // Guards the pair, not the literals: lowering the grace default OR raising the poll interval
+    // default re-opens the race this floor exists to close, and would otherwise only show up as a
+    // console line at boot.
+    expect(resolveReapGrace(ZOMBIE_REAP_GRACE_MS, CHEAP_INTERVAL_MS, LIST_TIMEOUT))
+      .toEqual({ ms: ZOMBIE_REAP_GRACE_MS, message: null });
+  });
+});

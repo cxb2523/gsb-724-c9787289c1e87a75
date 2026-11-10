@@ -1,0 +1,466 @@
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { createServer, type Server } from "node:http";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import { WebSocket } from "ws";
+
+import type { HerdrEnv } from "../environments.ts";
+import type { PtyLike } from "../server/pty-bridge.ts";
+import { lastViewport, recordViewport } from "../server/viewport.ts";
+import { createSpawnLimiter } from "../server/ws-attach-guard.ts";
+import { attachFailureReason, attachWebSocketServer, auditLine, type AttachServerOptions, type PtySpawnFn } from "../server/ws-attach.ts";
+
+const ENV: HerdrEnv = { id: "work-local", label: "Work", kind: "local", claudeConfigDirs: [], spawnCommand: "claude", repos: {} };
+
+interface FakePty extends PtyLike {
+  emitData(d: string | Buffer): void;
+  emitExit(): void;
+  readonly writes: string[];
+  readonly resizes: [number, number][];
+  readonly kills: string[];
+}
+
+function makeFakePty(): FakePty {
+  const dataCbs: ((d: string | Buffer) => void)[] = [];
+  const exitCbs: (() => void)[] = [];
+  const writes: string[] = [];
+  const resizes: [number, number][] = [];
+  const kills: string[] = [];
+  return {
+    onData: (cb) => { dataCbs.push(cb); },
+    onExit: (cb) => { exitCbs.push(cb); },
+    write: (d) => { writes.push(d); },
+    resize: (c, r) => { resizes.push([c, r]); },
+    kill: (s) => { kills.push(s ?? ""); },
+    emitData: (d) => { for (const cb of dataCbs) cb(d); },
+    emitExit: () => { for (const cb of exitCbs) cb(); },
+    writes, resizes, kills,
+  };
+}
+
+interface Harness {
+  readonly port: number;
+  readonly ptys: FakePty[];
+  readonly spawnOptions: { cols: number; rows: number }[];
+  readonly auditPath: string;
+  readonly focusCalls: string[];
+  close(): Promise<void>;
+}
+
+const servers: Server[] = [];
+const clients: WebSocket[] = [];
+
+async function start(overrides: Partial<AttachServerOptions> = {}): Promise<Harness> {
+  const ptys: FakePty[] = [];
+  const spawnOptions: { cols: number; rows: number }[] = [];
+  const spawn: PtySpawnFn = (_file, _args, options) => {
+    spawnOptions.push({ cols: options.cols, rows: options.rows });
+    const p = makeFakePty();
+    ptys.push(p);
+    return p;
+  };
+  const dir = mkdtempSync(path.join(tmpdir(), "wsatt-"));
+  const auditPath = path.join(dir, "attach-audit.log");
+  const server = createServer();
+  servers.push(server);
+  await new Promise<void>((res) => { server.listen(0, "127.0.0.1", res); });
+  const addr = server.address();
+  const port = typeof addr === "object" && addr !== null ? addr.port : 0;
+  // Recording stand-in, ALWAYS injected: the production default translator shells out to herdr, which a
+  // test must never do — and it makes the focus cycle observable here.
+  const focusCalls: string[] = [];
+  attachWebSocketServer(server, {
+    envs: [ENV],
+    allowedOrigins: [`http://127.0.0.1:${String(port)}`, `http://localhost:${String(port)}`],
+    spawn,
+    auditLogPath: auditPath,
+    focus: {
+      onAttachOpen: (_e, paneId) => { focusCalls.push(`open ${paneId}`); },
+      onAttachClose: (_e, paneId) => { focusCalls.push(`close ${paneId}`); },
+    },
+    ...overrides,
+  });
+  return {
+    port, ptys, spawnOptions, auditPath, focusCalls,
+    close: () => new Promise<void>((res) => { server.close(() => { res(); }); }),
+  };
+}
+
+function connect(port: number, pane: string, origin: string, query = ""): WebSocket {
+  const ws = new WebSocket(`ws://127.0.0.1:${String(port)}/api/sessions/work-local/${pane}/attach${query}`, { origin });
+  clients.push(ws);
+  return ws;
+}
+
+function once(emitter: { once(ev: string, cb: (...a: unknown[]) => void): void }, event: string): Promise<unknown[]> {
+  return new Promise((resolve) => { emitter.once(event, (...args: unknown[]) => { resolve(args); }); });
+}
+
+async function waitFor(pred: () => boolean, timeoutMs = 3000): Promise<void> {
+  const start0 = Date.now();
+  while (!pred()) {
+    if (Date.now() - start0 > timeoutMs) throw new Error("waitFor timeout");
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
+afterEach(async () => {
+  for (const c of clients.splice(0)) { try { c.terminate(); } catch { /* noop */ } }
+  for (const s of servers.splice(0)) { await new Promise<void>((res) => { s.close(() => { res(); }); }); }
+});
+
+// Placed first: viewport memory is module state with no reset export, and the empty-memory cases
+// below must run before anything else in this file writes a value into it.
+describe("attach pty size at spawn", () => {
+  it("spawns the pty at the size the client sent", async () => {
+    const h = await start();
+    const client = connect(h.port, "w1-1", `http://127.0.0.1:${String(h.port)}`, "?cols=188&rows=45");
+    await once(client, "open");
+    await waitFor(() => h.ptys.length === 1);
+    expect(h.spawnOptions[0]).toMatchObject({ cols: 188, rows: 45 });
+  });
+
+  it("falls back to 80x24 when nothing is known", async () => {
+    expect(lastViewport()).toBeNull();
+    const h = await start();
+    const client = connect(h.port, "w1-1", `http://127.0.0.1:${String(h.port)}`);
+    await once(client, "open");
+    await waitFor(() => h.ptys.length === 1);
+    expect(h.spawnOptions[0]).toMatchObject({ cols: 80, rows: 24 });
+  });
+
+  it("an attach with no query does not mutate viewport memory", async () => {
+    expect(lastViewport()).toBeNull();
+    const h = await start();
+    const client = connect(h.port, "w1-1", `http://127.0.0.1:${String(h.port)}`);
+    await once(client, "open");
+    await waitFor(() => h.ptys.length === 1);
+    expect(lastViewport()).toBeNull();
+  });
+
+  it("falls back to the remembered viewport when the client sends no size", async () => {
+    recordViewport(150, 40);
+    const h = await start();
+    const client = connect(h.port, "w1-1", `http://127.0.0.1:${String(h.port)}`);
+    await once(client, "open");
+    await waitFor(() => h.ptys.length === 1);
+    expect(h.spawnOptions[0]).toMatchObject({ cols: 150, rows: 40 });
+  });
+
+  it("prefers the size the client just sent over a remembered viewport, when both are in play", async () => {
+    recordViewport(150, 40);
+    const h = await start();
+    const client = connect(h.port, "w1-1", `http://127.0.0.1:${String(h.port)}`, "?cols=188&rows=45");
+    await once(client, "open");
+    await waitFor(() => h.ptys.length === 1);
+    expect(h.spawnOptions[0]).toMatchObject({ cols: 188, rows: 45 });
+  });
+});
+
+describe("auditLine (SEC-6: open/close + source, never keystrokes)", () => {
+  it("serializes an open entry with the resolved command and no keystroke field", () => {
+    const line = auditLine({
+      event: "open", ts: "2026-07-07T00:00:00.000Z", env: "work-local", paneId: "w1-1",
+      origin: "http://127.0.0.1:8787", resolvedCommand: "herdr agent attach w1-1 --takeover",
+    });
+    expect(line.endsWith("\n")).toBe(true);
+    const parsed: unknown = JSON.parse(line);
+    expect(parsed).toMatchObject({ event: "open", env: "work-local", paneId: "w1-1" });
+    expect(line).toContain("agent attach w1-1 --takeover");
+    expect(line.toLowerCase()).not.toContain("keystroke");
+  });
+  it("serializes a close entry", () => {
+    const parsed: unknown = JSON.parse(auditLine({ event: "close", ts: "T", env: "e", paneId: "p" }));
+    expect(parsed).toMatchObject({ event: "close", env: "e", paneId: "p" });
+    expect(auditLine({ event: "close", ts: "T", env: "e", paneId: "p" })).not.toContain("probeFailed");
+  });
+  it("marks a probe-window close with a FLAG and carries no diagnostic text", () => {
+    // Without the flag, an attach that died instantly and a normal end of session were byte-identical
+    // here, so a later log-only diagnosis could not tell them apart. The child's output stays OUT:
+    // SEC-6 excludes session content, and a real agent dying inside the probe window would contribute
+    // its first screenful, not an exec error. The operator gets the text in the close reason instead.
+    const line = auditLine({ event: "close", ts: "T", env: "e", paneId: "p", probeFailed: true });
+    expect(JSON.parse(line)).toMatchObject({ event: "close", probeFailed: true });
+    expect(line.toLowerCase()).not.toContain("execvp");
+  });
+});
+
+describe("attachWebSocketServer (integration, injected fake pty)", () => {
+  it("attaches a valid upgrade: spawns via buildAttachSpec (takeover), routes keystrokes + resize, streams output", async () => {
+    const h = await start();
+    const client = connect(h.port, "w1-1", `http://127.0.0.1:${String(h.port)}`);
+    await once(client, "open");
+    await waitFor(() => h.ptys.length === 1);
+
+    client.send(Buffer.from("ls\n")); // binary frame = keystrokes
+    await waitFor(() => (h.ptys[0]?.writes.length ?? 0) > 0);
+    expect(h.ptys[0]?.writes).toContain("ls\n");
+
+    client.send(JSON.stringify({ type: "resize", cols: 100, rows: 40 })); // text frame = control
+    await waitFor(() => (h.ptys[0]?.resizes.length ?? 0) > 0);
+    expect(h.ptys[0]?.resizes[0]).toEqual([100, 40]);
+
+    const msg = once(client, "message");
+    h.ptys[0]?.emitData(Buffer.from("hello-out"));
+    const [data] = await msg;
+    expect(Buffer.isBuffer(data) ? data.toString("utf8") : String(data)).toBe("hello-out");
+
+    await waitFor(() => existsSync(h.auditPath) && readFileSync(h.auditPath, "utf8").includes('"open"'));
+    const audit = readFileSync(h.auditPath, "utf8");
+    expect(audit).toContain("agent attach w1-1 --takeover");
+    expect(audit).not.toContain("ls\\n"); // SEC-6: keystrokes never hit the audit log
+  });
+
+  // Opening the terminal focuses the pane's tab and closing it restores the previous one. That cycle is
+  // the whole point: only a pane that has been focused and then blurred can write an away_summary recap.
+  it("runs the focus cycle across the attach's open and close", async () => {
+    const h = await start();
+    const client = connect(h.port, "w1-1", `http://127.0.0.1:${String(h.port)}`);
+    await once(client, "open");
+    await waitFor(() => h.focusCalls.length === 1);
+    expect(h.focusCalls).toEqual(["open w1-1"]);
+
+    client.close();
+    await waitFor(() => h.focusCalls.length === 2);
+    expect(h.focusCalls).toEqual(["open w1-1", "close w1-1"]);
+  });
+
+  it("does not move focus when the pty fails to spawn", async () => {
+    const h = await start({ spawn: () => { throw new Error("no pty"); } });
+    const client = connect(h.port, "w1-1", `http://127.0.0.1:${String(h.port)}`);
+    await once(client, "close");
+    expect(h.focusCalls).toEqual([]);
+  });
+
+  it("rejects a disallowed Origin — no pty is spawned (SEC-1)", async () => {
+    const h = await start();
+    const client = connect(h.port, "w1-1", "https://evil.example");
+    await new Promise<void>((res) => {
+      client.once("error", () => { res(); });
+      client.once("close", () => { res(); });
+    });
+    expect(h.ptys.length).toBe(0);
+  });
+
+  it("rejects a leading-dash paneId — no pty is spawned (SEC-4)", async () => {
+    const h = await start();
+    const client = connect(h.port, "-danger", `http://127.0.0.1:${String(h.port)}`);
+    await new Promise<void>((res) => {
+      client.once("error", () => { res(); });
+      client.once("close", () => { res(); });
+    });
+    expect(h.ptys.length).toBe(0);
+  });
+
+  it("closes with 1013 when the spawn limiter is exhausted (SEC-2)", async () => {
+    const h = await start({ limiter: { tryReserve: () => false, release: () => { /* noop */ } } });
+    const client = connect(h.port, "w1-1", `http://127.0.0.1:${String(h.port)}`);
+    const code = await new Promise<number>((res) => {
+      client.once("close", (c: number) => { res(c); });
+      client.once("error", () => { /* a 1013 close may surface as error on some paths */ });
+    });
+    expect(code).toBe(1013);
+    expect(h.ptys.length).toBe(0);
+  });
+
+  it("closes 4001 'attach unavailable' when the pty exits within the probe grace", async () => {
+    // 4001 is a locked contract with SessionModal.closeMessage — a pane that's gone / a herdr error
+    // must render a reason, not a blank terminal. The probe's onExit is registered before the
+    // bridge's, so 4001 must win the close race over the generic 1000.
+    const h = await start();
+    const client = connect(h.port, "w1-1", `http://127.0.0.1:${String(h.port)}`);
+    await once(client, "open");
+    await waitFor(() => h.ptys.length === 1);
+    h.ptys[0]?.emitExit(); // immediately → well within WS_PROBE_GRACE_MS
+    const [code, reason] = await once(client, "close");
+    expect(code).toBe(4001);
+    expect(String(reason)).toBe("attach unavailable");
+  });
+
+  it("closes 4001 carrying the child's OWN error text when the command failed to exec", async () => {
+    // node-pty forks successfully for a command that does not exist: execvp fails in the CHILD, so the
+    // parent's try/catch around the spawn never fires and the attach is audited as a clean open. The
+    // child's output was the only evidence of the cause and it was being discarded — the modal said
+    // "attach unavailable" while the real reason (herdr unresolvable on the server's PATH) went
+    // unreported. 4001 is unchanged: it is a locked contract with SessionModal + lib/attach's
+    // post-spawn retry. The reason rides along, and closeMessage already prefers it over the mapping.
+    const h = await start();
+    const client = connect(h.port, "w1-1", `http://127.0.0.1:${String(h.port)}`);
+    await once(client, "open");
+    await waitFor(() => h.ptys.length === 1);
+    h.ptys[0]?.emitData("execvp(3) failed.: No such file or directory\r\n");
+    h.ptys[0]?.emitExit();
+    const [code, reason] = await once(client, "close");
+    expect(code).toBe(4001);
+    expect(String(reason)).toContain("execvp(3) failed");
+    // The persisted trail records THAT it failed in the probe window, and still no session content.
+    await waitFor(() => existsSync(h.auditPath) && readFileSync(h.auditPath, "utf8").includes('"close"'));
+    const audit = readFileSync(h.auditPath, "utf8");
+    expect(audit).toContain('"probeFailed":true');
+    expect(audit).not.toContain("execvp");
+  });
+
+  it("closes 1000 when the pty exits after the probe grace (normal end of session)", async () => {
+    let t = 0;
+    const h = await start({ now: () => t });
+    const client = connect(h.port, "w1-1", `http://127.0.0.1:${String(h.port)}`);
+    await once(client, "open");
+    await waitFor(() => h.ptys.length === 1);
+    t = 60_000; // long past WS_PROBE_GRACE_MS — the attach was healthy, this is a normal exit
+    h.ptys[0]?.emitExit();
+    const [code, reason] = await once(client, "close");
+    expect(code).toBe(1000);
+    expect(String(reason)).toBe("pty exited");
+    // A healthy session ending must NOT be flagged as a probe failure, or the flag means nothing.
+    await waitFor(() => existsSync(h.auditPath) && readFileSync(h.auditPath, "utf8").includes('"close"'));
+    expect(readFileSync(h.auditPath, "utf8")).not.toContain("probeFailed");
+  });
+
+  it("closes 4000 'attach failed' when spawn throws (e.g. node-pty ENOENT), audits it, spawns no pty", async () => {
+    const h = await start({ spawn: () => { throw new Error("ENOENT herdr"); } });
+    const client = connect(h.port, "w1-1", `http://127.0.0.1:${String(h.port)}`);
+    const [code, reason] = await once(client, "close");
+    expect(code).toBe(4000);
+    expect(String(reason)).toBe("attach failed");
+    expect(h.ptys.length).toBe(0);
+    await waitFor(() => existsSync(h.auditPath) && readFileSync(h.auditPath, "utf8").includes("spawn failed"));
+    expect(readFileSync(h.auditPath, "utf8")).toContain("[spawn failed: ENOENT herdr]");
+  });
+
+  it("releases the reserved slot on close so the next attach succeeds (SEC-2, no slot leak)", async () => {
+    const inner = createSpawnLimiter({ maxConcurrent: 1, ratePerWindow: 100, windowMs: 100_000, now: () => Date.now() });
+    let releases = 0;
+    const limiter = {
+      tryReserve: () => inner.tryReserve(),
+      release: () => { releases += 1; inner.release(); },
+    };
+    const h = await start({ limiter });
+
+    const c1 = connect(h.port, "w1-1", `http://127.0.0.1:${String(h.port)}`);
+    await once(c1, "open");
+    await waitFor(() => h.ptys.length === 1);
+    c1.close();
+    await waitFor(() => releases === 1); // the slot is released on the socket's close (not leaked)
+
+    const c2 = connect(h.port, "w1-2", `http://127.0.0.1:${String(h.port)}`);
+    const outcome = await Promise.race([
+      once(c2, "open").then(() => "open"),
+      new Promise<string>((res) => { c2.once("close", (code: number) => { res(`close:${String(code)}`); }); }),
+    ]);
+    expect(outcome).toBe("open"); // slot was free again → second attach reserved successfully
+    expect(h.ptys.length).toBe(2);
+  });
+});
+
+describe("attachFailureReason", () => {
+  it("keeps the historical string when the child printed nothing", () => {
+    // Also what closeMessage falls back to client-side, so an empty reason stays consistent.
+    expect(attachFailureReason("")).toBe("attach unavailable");
+  });
+
+  it("strips ANSI sequences and control bytes and collapses the blanks they leave behind", () => {
+    const raw = `${String.fromCharCode(27)}[31mexecvp(3) failed.:\r\n${String.fromCharCode(27)}[0m No such file`;
+    expect(attachFailureReason(raw)).toBe("attach failed: execvp(3) failed.: No such file");
+  });
+
+  it("truncates to the WebSocket protocol's 123-byte close-reason limit", () => {
+    // `ws` throws on a longer reason, which would turn a diagnostic into a second, opaque failure.
+    const reason = attachFailureReason("x".repeat(500));
+    expect(Buffer.byteLength(reason, "utf8")).toBeLessThanOrEqual(123);
+    expect(reason.startsWith("attach failed: xxx")).toBe(true);
+  });
+
+  it("drops an OSC title sequence instead of leaking its payload into the reason", () => {
+    // OSC/DCS introducers sit inside the CSI final-byte range, so a CSI-only scan stops on the
+    // introducer and the title becomes text. It arrives BEFORE the child's error and the reason is
+    // byte-capped, so a long title would push the actual cause out of the budget entirely.
+    const esc = String.fromCharCode(27);
+    const bel = String.fromCharCode(7);
+    expect(attachFailureReason(`${esc}]0;a very long herdr window title${bel}execvp(3) failed.: No such file`))
+      .toBe("attach failed: execvp(3) failed.: No such file");
+    expect(attachFailureReason(`${esc}P1;2q#0${esc}\\boom`)).toBe("attach failed: boom");
+  });
+
+  it("drops a two-byte escape and keeps the text after it", () => {
+    expect(attachFailureReason(`${String.fromCharCode(27)}Mreal error text`)).toBe("attach failed: real error text");
+  });
+
+  it("stays cheap on a large input — the trim must not be quadratic", () => {
+    // The truncation used to re-join the whole array on every popped character, and the capture cap let
+    // an arbitrarily large first chunk through. Together that blocked the single event loop for seconds
+    // (measured ~8 s at 64 KiB), stalling the poller, every SSE stream and every other attach.
+    const t0 = performance.now();
+    const reason = attachFailureReason("a".repeat(200_000));
+    const elapsed = performance.now() - t0;
+    expect(Buffer.byteLength(reason, "utf8")).toBeLessThanOrEqual(123);
+    expect(elapsed).toBeLessThan(100);
+  });
+
+  it("truncates on a code-point boundary, so multi-byte output cannot emit a broken reason", () => {
+    // Trimming UTF-16 units instead would strip half a surrogate pair and leave a lone surrogate,
+    // which the operator then reads as a replacement character. Covers BMP and astral input.
+    for (const filler of ["—", "🐎"]) {
+      const reason = attachFailureReason(filler.repeat(200));
+      expect(Buffer.byteLength(reason, "utf8")).toBeLessThanOrEqual(123);
+      expect(Array.from(reason).every((ch) => { const c = ch.codePointAt(0) ?? 0; return c < 0xd800 || c > 0xdfff; })).toBe(true);
+    }
+  });
+});
+
+describe("onViewed", () => {
+  it("reports the pane as viewed when a healthy attach closes", async () => {
+    let t = 0;
+    const viewed: string[] = [];
+    const h = await start({ now: () => t, onViewed: (_e, p) => { viewed.push(p); } });
+    const client = connect(h.port, "w1-1", `http://127.0.0.1:${String(h.port)}`);
+    await once(client, "open");
+    t = 60_000;
+    client.close();
+    await waitFor(() => viewed.length === 1);
+    expect(viewed).toEqual(["w1-1"]);
+  });
+
+  it("does not report viewed when the attach dies inside the probe grace", async () => {
+    const viewed: string[] = [];
+    const h = await start({ now: () => 0, onViewed: (_e, p) => { viewed.push(p); } });
+    const client = connect(h.port, "w1-1", `http://127.0.0.1:${String(h.port)}`);
+    await once(client, "open");
+    await waitFor(() => h.ptys.length === 1);
+    h.ptys[0]?.emitExit();
+    await once(client, "close");
+    await new Promise((r) => setTimeout(r, 50));
+    expect(viewed).toEqual([]);
+  });
+
+  it("does not report viewed when the probe-window death's ws close completes after the grace elapses", async () => {
+    // Elapsed-time-only gating would count this viewed: close fires once t has passed the grace.
+    let t = 0;
+    const viewed: string[] = [];
+    const h = await start({ now: () => t, onViewed: (_e, p) => { viewed.push(p); } });
+    const client = connect(h.port, "w1-1", `http://127.0.0.1:${String(h.port)}`);
+    await once(client, "open");
+    await waitFor(() => h.ptys.length === 1);
+    h.ptys[0]?.emitExit(); // t=0, well within WS_PROBE_GRACE_MS
+    t = 60_000; // advance before the async close handshake completes, as if it ran late
+    await once(client, "close");
+    await new Promise((r) => setTimeout(r, 50));
+    expect(viewed).toEqual([]);
+  });
+});
+
+// Placed last, deliberately: this block records into viewport memory, and the empty-memory
+// assertions earlier in the file depend on running before that happens.
+describe("viewport wiring: the attach's resize frame reaches recordViewport", () => {
+  it("records the last resize frame's size in viewport memory", async () => {
+    const h = await start();
+    const client = connect(h.port, "w1-1", `http://127.0.0.1:${String(h.port)}`);
+    await once(client, "open");
+    await waitFor(() => h.ptys.length === 1);
+
+    client.send(JSON.stringify({ type: "resize", cols: 188, rows: 45 }));
+    await waitFor(() => (h.ptys[0]?.resizes.length ?? 0) > 0);
+
+    expect(lastViewport()).toEqual({ cols: 188, rows: 45 });
+  });
+});

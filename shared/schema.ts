@@ -1,0 +1,213 @@
+import { z } from "zod";
+
+export const EnvStateSchema = z.object({
+  reachable: z.boolean(),
+  error: z.string().optional(),
+  // Static env kind (from trusted config). Optional on the wire so legacy/partial payloads and existing
+  // fixtures stay valid; the poller always populates it. The web uses it to offer file-drop on local only.
+  kind: z.enum(["local", "remote"]).optional(),
+  // Operator-facing display name from the trusted env config (environments.ts `label`). Optional on the
+  // wire like `kind` so legacy/partial payloads and fixtures stay valid; the poller always populates it.
+  // The web shows it in place of the raw env id (routing still keys on the id).
+  label: z.string().optional(),
+});
+
+export const RecapStatusSchema = z.enum(["ok", "no-session-ref", "not-found", "no-summary", "read-error"]);
+
+// WHICH transcript record the recap line came from. Separate from RecapStatus, which is the health of
+// the read: a successful read can still be showing the operator's own last prompt rather than a recap
+// the session wrote about itself, and collapsing the two would make "ok" mean both.
+//
+// `away-summary` is the only rung Claude writes ABOUT ITS OWN WORK — and the only one that can go silent:
+// it needs a terminal focus-out plus an account at exactly `allowed` rate-limit status (docs/adr/0005).
+// `ai-title` is the topic Claude generates for the session; `last-prompt` is what the
+// operator asked for, not what came of it. Ordered by descending quality, which is the order readRecap
+// tries them in.
+export const RecapSourceSchema = z.enum(["away-summary", "ai-title", "last-prompt"]);
+
+export const RateWindowSchema = z.object({
+  used_percentage: z.number(),
+  resets_at: z.number(),
+});
+
+export const StatuslineAccountSchema = z.object({
+  uuid: z.string().nullable(),
+  email: z.string().nullable(),
+  org: z.string().nullable(),
+  tier: z.string().nullable(),
+});
+
+export const StatuslineDataSchema = z.object({
+  v: z.literal(1),
+  captured_at: z.number(),
+  session_id: z.string(),
+  account: StatuslineAccountSchema.nullable(),
+  model: z.string().nullable(),
+  model_id: z.string().nullable(),
+  ctx: z.object({ pct: z.number().nullable(), tokens: z.number().nullable(), window: z.number().nullable() }),
+  cost: z.object({ usd: z.number().nullable(), lines_added: z.number().nullable(), lines_removed: z.number().nullable() }),
+  rate: z.object({ five_hour: RateWindowSchema.nullable(), seven_day: RateWindowSchema.nullable() }),
+  effort: z.string().nullable(),
+  thinking: z.boolean().nullable(),
+  cc_version: z.string().nullable(),
+});
+
+export const StatuslineStatusSchema = z.enum(["ok", "no-session-ref", "not-found", "bad-schema", "read-error"]);
+
+// Health of the registry read behind claudeStatus/waitingFor/remoteControl, mirroring the discipline
+// recapStatus and statuslineStatus already have. Without it a bare `claudeStatus: null` would mean all
+// of "no config dirs", "unreadable", "unparseable", "no record for this session" and "the sweep has
+// not run yet" at once — a degraded state indistinguishable from a healthy one.
+//
+// `bad-schema` is also the DRIFT DETECTOR: this feature reads an undocumented file format from an
+// auto-updating CLI, and a format change must surface as an error rather than as silence.
+export const RegistryStatusSchema = z.enum([
+  "ok", "no-session-ref", "no-config-dirs", "not-found", "bad-schema", "read-error",
+]);
+
+export const AccountUsageSchema = z.object({
+  uuid: z.string(),
+  email: z.string().nullable(),
+  org: z.string().nullable(),
+  tier: z.string().nullable(),
+  fiveHour: RateWindowSchema.nullable(),
+  sevenDay: RateWindowSchema.nullable(),
+  capturedAt: z.number(),
+  envIds: z.array(z.string()),
+});
+
+export const SessionRowSchema = z.object({
+  env: z.string(),
+  paneId: z.string(),
+  status: z.string(),
+  agent: z.string(),
+  cwd: z.string(),
+  tab: z.string(),
+  workspace: z.string(),
+  // Stable herdr ids behind the labels. Persisted onto a SessionLink at attach/from-session so a later
+  // close/resume has real coordinates (labels alone can't address a tab), and so close can heal a
+  // legacy empty-id link from the live row. Optional: a live row from `listSessions` always carries
+  // them, but they're absent on legacy payloads → `undefined` (consumers fall back).
+  tabId: z.string().optional(),
+  workspaceId: z.string().optional(),
+  sessionId: z.string().nullable().default(null),
+  recap: z.string().nullable().default(null),
+  recapAt: z.number().nullable().default(null),
+  recapStatus: RecapStatusSchema.nullable().default(null),
+  recapSource: RecapSourceSchema.nullable().default(null),
+  statusline: StatuslineDataSchema.nullable().default(null),
+  statuslineStatus: StatuslineStatusSchema.nullable().default(null),
+  // Claude's OWN session state, from <claude-config-dir>/sessions/<pid>.json. Exactly ONE writer per
+  // environment fills these: a 3 s interval for local environments, the 60 s sweep for remote ones,
+  // both doing full directory reads through the same reader — so absence is always authoritative and
+  // there is no precedence rule between them.
+  // `claudeStatus` is Claude's idle | busy | waiting | shell, distinct from `status`, which is herdr's
+  // agent_status. `waitingFor` names what is holding the input line. `remoteControl` is null when
+  // UNKNOWN — not false; see the tri-state in server/session-registry.ts.
+  claudeStatus: z.string().nullable().default(null),
+  waitingFor: z.string().nullable().default(null),
+  remoteControl: z.boolean().nullable().default(null),
+  registryStatus: RegistryStatusSchema.nullable().default(null),
+  // The session's own name, and a DECISION about its provenance rather than a copy of `nameSource`.
+  // The registry is the ONE source of a live session's name — the statusline capture no longer carries
+  // one — so every reader and every writer of a name goes through this pair.
+  // `"derived"` — Claude's own auto-name — is the only value that closes the gate; a marker corral has
+  // not been told about fails OPEN (see the drift nudge at RegistryRecordSchema). null = no record for
+  // this pane; false = a record with no usable name, or one Claude named itself; true = a record whose
+  // name was set deliberately, and the only state any writer of a name acts on.
+  claudeName: z.string().nullable().default(null),
+  claudeNameUserSet: z.boolean().nullable().default(null),
+});
+
+export const SnapshotSchema = z.object({
+  envs: z.record(z.string(), EnvStateSchema),
+  sessions: z.array(SessionRowSchema),
+});
+
+export const PaneReadSchema = z.object({
+  text: z.string(),
+  ctxPct: z.string().nullable(),
+  model: z.string().nullable(),
+  sessionName: z.string().nullable(),
+});
+
+export const AttentionStateSchema = z.enum(["blocked", "finished"]);
+
+export const AttentionRecordSchema = z.object({
+  state: AttentionStateSchema,
+  since: z.number(),
+  sessionName: z.string().nullable(),
+  lastLines: z.string(),
+  captured: z.boolean(),
+});
+
+export const AttentionMapSchema = z.record(z.string(), AttentionRecordSchema).default({});
+
+// Body for POST /api/boards/:bid/tasks/:tid/move — relocate a task to another board.
+export const MoveTaskRequestSchema = z.object({ toBoardId: z.string() });
+
+// Response of POST /api/envs/:env/uploads — the absolute on-host path the dropped bytes were written to.
+export const UploadResponseSchema = z.object({ path: z.string() });
+
+// Response of GET /api/card-signal — the corral-claude-hook.sh card-empty check. `true` means the
+// caller's pane is bound to a card whose description is blank; `false` covers every other case
+// (unresolvable pane, no card, non-blank description) deliberately conflated, since the hook has
+// exactly two behaviours and a distinction it cannot act on invites wrong handling.
+export const CardSignalResponseSchema = z.object({ empty: z.boolean() });
+export type CardSignalResponse = z.infer<typeof CardSignalResponseSchema>;
+
+// Single source of truth for the drop-upload byte cap: the server enforces it (pre-buffer, via
+// hono/body-limit) and the web pre-checks against it, so client and server limits cannot drift.
+export const UPLOAD_MAX_BYTES = 25 * 1024 * 1024;
+
+// ---- fleet restore (POST /api/fleet/restore → scripts/fleet-restore.ts) ----
+// Crosses the REST boundary to the terminal script, hence shared. `would_resume` is the dry-run
+// outcome; `unmirrored` counts live sessions carrying a sessionId that the mirror has NO record of —
+// the pre-upgrade health signal (a nonzero value on a dry run means "do not kill herdr yet").
+export const FleetRestoreOutcomeSchema = z.enum([
+  "resumed", "skipped_alive", "skipped_recent", "failed", "would_resume",
+]);
+
+export const FleetRestoreSessionSchema = z.object({
+  sessionId: z.string(),
+  name: z.string(),
+  outcome: FleetRestoreOutcomeSchema,
+  error: z.string().nullable(),
+});
+
+export const FleetRestoreEnvReportSchema = z.object({
+  // env-level failure: unreachable / listing failed / not_in_mirror. Session-level outcomes are per-row.
+  error: z.string().nullable(),
+  // the env's mirror updatedAt (secs) — staleness signal; null when the env has no mirror entry
+  updatedAt: z.number().nullable(),
+  unmirrored: z.number(),
+  sessions: z.array(FleetRestoreSessionSchema),
+  // the stuck-pending visibility signal for the pre-upgrade dry run
+  pendingRestore: z.boolean(),
+});
+
+export const FleetRestoreReportSchema = z.object({
+  dryRun: z.boolean(),
+  envs: z.record(z.string(), FleetRestoreEnvReportSchema),
+});
+
+export type EnvState = z.infer<typeof EnvStateSchema>;
+export type RecapStatus = z.infer<typeof RecapStatusSchema>;
+export type RecapSource = z.infer<typeof RecapSourceSchema>;
+export type SessionRow = z.infer<typeof SessionRowSchema>;
+export type Snapshot = z.infer<typeof SnapshotSchema>;
+export type PaneRead = z.infer<typeof PaneReadSchema>;
+export type AttentionState = z.infer<typeof AttentionStateSchema>;
+export type AttentionRecord = z.infer<typeof AttentionRecordSchema>;
+export type AttentionMap = z.infer<typeof AttentionMapSchema>;
+export type MoveTaskRequest = z.infer<typeof MoveTaskRequestSchema>;
+export type UploadResponse = z.infer<typeof UploadResponseSchema>;
+export type RateWindow = z.infer<typeof RateWindowSchema>;
+export type StatuslineData = z.infer<typeof StatuslineDataSchema>;
+export type StatuslineStatus = z.infer<typeof StatuslineStatusSchema>;
+export type RegistryStatus = z.infer<typeof RegistryStatusSchema>;
+export type AccountUsage = z.infer<typeof AccountUsageSchema>;
+export type FleetRestoreOutcome = z.infer<typeof FleetRestoreOutcomeSchema>;
+export type FleetRestoreSession = z.infer<typeof FleetRestoreSessionSchema>;
+export type FleetRestoreEnvReport = z.infer<typeof FleetRestoreEnvReportSchema>;
+export type FleetRestoreReport = z.infer<typeof FleetRestoreReportSchema>;

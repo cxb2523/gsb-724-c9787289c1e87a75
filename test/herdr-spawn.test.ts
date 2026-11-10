@@ -1,0 +1,363 @@
+import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
+
+import { FOCUS_TRANSLATION_ENABLED, LIST_TIMEOUT, PANE_SIZE_RETRY_AFTER_MS, PANE_SIZE_TIMEOUT_MS } from "../config.ts";
+import { ENVIRONMENTS, getEnv } from "../environments.ts";
+import type { HerdrEnv } from "../environments.ts";
+import type { ExecFn } from "../server/herdr.ts";
+import { paneRun, paneGet, tabCreate, tabFocus, focusedTabId, workspaceCreate, tabClose, tabRename, listPanes, listAllPanes, paneSetSize } from "../server/herdr.ts";
+
+const env = ENVIRONMENTS[0]!;
+const remoteEnv = getEnv("work-remote");
+
+function makeExec(stdout: string): ExecFn {
+  return async (_file, args) => {
+    // capture the args to verify
+    (makeExec as unknown as { lastArgs: readonly string[] }).lastArgs = args;
+    return { stdout, stderr: "" };
+  };
+}
+
+describe("paneRun", () => {
+  it("calls pane run with text arg", async () => {
+    const exec = makeExec("");
+    await paneRun(env, "w1-1", "/rename my-task", exec);
+    expect((makeExec as unknown as { lastArgs: string[] }).lastArgs).toContain("run");
+    expect((makeExec as unknown as { lastArgs: string[] }).lastArgs).toContain("w1-1");
+  });
+});
+
+describe("paneGet", () => {
+  it("parses pane_id, tab_id, workspace_id, cwd", async () => {
+    const payload = JSON.stringify({
+      result: {
+        pane: {
+          pane_id: "w1-1", tab_id: "t1", workspace_id: "ws1",
+          cwd: "/home/me/project", foreground_cwd: "/home/me/project",
+          agent: "claude", agent_status: "idle", focused: false, revision: 0,
+          terminal_id: "term_1",
+        },
+        type: "pane_info",
+      },
+    });
+    const exec = makeExec(payload);
+    const result = await paneGet(env, "w1-1", exec);
+    expect(result.tabId).toBe("t1");
+    expect(result.workspaceId).toBe("ws1");
+    expect(result.cwd).toBe("/home/me/project");
+  });
+});
+
+describe("tabCreate (herdr 0.7.1 nested shape)", () => {
+  it("returns {tabId, paneId} from result.tab / result.root_pane", async () => {
+    const payload = JSON.stringify({
+      result: {
+        tab: { tab_id: "w8:t2", label: "probe-tab", workspace_id: "w8" },
+        root_pane: { pane_id: "w8:p2", cwd: "/proj", tab_id: "w8:t2", workspace_id: "w8" },
+        type: "tab_created",
+      },
+    });
+    const out = await tabCreate(env, "w8", "/proj", "my-task", makeExec(payload));
+    expect(out).toEqual({ tabId: "w8:t2", paneId: "w8:p2" });
+  });
+
+  it("falls back to flat tab_id/pane_id", async () => {
+    const payload = JSON.stringify({ result: { tab_id: "t2", pane_id: "p2" } });
+    const out = await tabCreate(env, "ws1", "/proj", "my-task", makeExec(payload));
+    expect(out).toEqual({ tabId: "t2", paneId: "p2" });
+  });
+
+  it("throws when neither shape yields ids", async () => {
+    await expect(tabCreate(env, "ws1", "/proj", "t", makeExec(JSON.stringify({ result: {} })))).rejects.toThrow(/tab create/);
+  });
+
+  // The focus flag is passed either way, never left to herdr's undocumented default: a pane that was
+  // never focused sits in Claude's `unknown` state, which is NOT `blurred`, and could then never write a
+  // recap however long the session runs.
+  it("states the focus intent explicitly, and matches the switch", async () => {
+    const payload = JSON.stringify({ result: { tab_id: "t2", pane_id: "p2" } });
+    await tabCreate(env, "ws1", "/proj", "my-task", makeExec(payload));
+    const args = (makeExec as unknown as { lastArgs: readonly string[] }).lastArgs;
+    // Asserting WHICH flag, not merely that one is present: an inverted flag is the failure that leaves
+    // every spawned pane in Claude's `unknown` focus state, unable to ever write a recap — and a test
+    // that accepts either value stays green through exactly that inversion.
+    expect(args).toContain(FOCUS_TRANSLATION_ENABLED ? "--focus" : "--no-focus");
+    expect(args).not.toContain(FOCUS_TRANSLATION_ENABLED ? "--no-focus" : "--focus");
+  });
+});
+
+describe("tabFocus / focusedTabId", () => {
+  // corral's only lever over a session's terminal focus state, and the one that revives away_summary:
+  // herdr delivers real focus-report sequences to the pane, with nothing written into the pane itself.
+  it("sends tab focus for the given tab", async () => {
+    const exec = makeExec("");
+    await tabFocus(env, "w1:t3", exec);
+    expect((makeExec as unknown as { lastArgs: readonly string[] }).lastArgs).toContain("focus");
+    expect((makeExec as unknown as { lastArgs: readonly string[] }).lastArgs).toContain("w1:t3");
+  });
+
+  it("reads the one focused tab out of tab list", async () => {
+    const payload = JSON.stringify({ result: { tabs: [
+      { tab_id: "w1:t1", label: "a", workspace_id: "w1", focused: false },
+      { tab_id: "w1:t2", label: "b", workspace_id: "w1", focused: true },
+    ] } });
+    expect(await focusedTabId(env, makeExec(payload))).toBe("w1:t2");
+  });
+
+  it("returns null when no tab reports focus — nothing to restore to is not an error", async () => {
+    const payload = JSON.stringify({ result: { tabs: [{ tab_id: "w1:t1", label: "a", workspace_id: "w1" }] } });
+    expect(await focusedTabId(env, makeExec(payload))).toBeNull();
+  });
+
+  it("returns null rather than throwing on an unparseable tab list", async () => {
+    expect(await focusedTabId(env, makeExec(JSON.stringify({ nope: true })))).toBeNull();
+  });
+});
+
+describe("workspaceCreate (herdr 0.7.1 nested shape)", () => {
+  it("reads result.workspace.workspace_id + the root_pane ids (so spawn can reuse the root tab)", async () => {
+    const payload = JSON.stringify({ result: { workspace: { workspace_id: "w8", label: "corral" }, root_pane: { pane_id: "w8:p1", tab_id: "w8:t1" } } });
+    expect(await workspaceCreate(env, "/proj", "corral", makeExec(payload))).toEqual({ workspaceId: "w8", rootTabId: "w8:t1", rootPaneId: "w8:p1" });
+  });
+
+  it("falls back to flat result.workspace_id with no root ids (older herdr → spawn creates a tab)", async () => {
+    expect(await workspaceCreate(env, "/proj", "w", makeExec(JSON.stringify({ result: { workspace_id: "ws2" } })))).toEqual({ workspaceId: "ws2", rootTabId: undefined, rootPaneId: undefined });
+  });
+
+  // The same exact-flag assertion as tabCreate, on purpose: when corral creates the workspace, spawn
+  // RENAMES the seeded root tab instead of calling tabCreate, so this call is the only focus decision
+  // that path ever makes. Two paths asserting the same rule cannot drift apart silently.
+  it("states the focus intent explicitly, and matches the switch", async () => {
+    await workspaceCreate(env, "/proj", "corral", makeExec(JSON.stringify({ result: { workspace_id: "ws2" } })));
+    const args = (makeExec as unknown as { lastArgs: readonly string[] }).lastArgs;
+    expect(args).toContain(FOCUS_TRANSLATION_ENABLED ? "--focus" : "--no-focus");
+    expect(args).not.toContain(FOCUS_TRANSLATION_ENABLED ? "--no-focus" : "--focus");
+  });
+});
+
+describe("listPanes", () => {
+  it("returns {paneId, cwd} per pane in a workspace", async () => {
+    const payload = JSON.stringify({ result: { panes: [{ pane_id: "w:p2", cwd: "/proj", tab_id: "w:t2", workspace_id: "w" }], type: "pane_list" } });
+    expect(await listPanes(env, "w", makeExec(payload))).toEqual([{ paneId: "w:p2", cwd: "/proj" }]);
+  });
+
+  it("returns [] on an unexpected shape", async () => {
+    expect(await listPanes(env, "w", makeExec("{}"))).toEqual([]);
+  });
+});
+
+describe("tabClose", () => {
+  it("calls tab close with tabId", async () => {
+    const exec = makeExec("");
+    await tabClose(env, "t1", exec);
+    expect((makeExec as unknown as { lastArgs: string[] }).lastArgs).toContain("close");
+    expect((makeExec as unknown as { lastArgs: string[] }).lastArgs).toContain("t1");
+  });
+});
+
+describe("tabRename", () => {
+  it("calls tab rename with tabId and label", async () => {
+    const exec = makeExec("");
+    await tabRename(env, "t1", "my label", exec);
+    const args = (makeExec as unknown as { lastArgs: string[] }).lastArgs;
+    expect(args).toEqual(["tab", "rename", "t1", "my label"]);
+  });
+});
+
+describe("listAllPanes", () => {
+  it("parses identity and marks a pane running an agent as occupied", async () => {
+    const payload = JSON.stringify({
+      result: {
+        panes: [{
+          agent: "claude",
+          agent_session: { agent: "claude", kind: "id", source: "herdr:claude", value: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" },
+          agent_status: "done",
+          cwd: "/proj", pane_id: "w1:p2", tab_id: "w1:t2", workspace_id: "w1",
+        }],
+      },
+    });
+    expect(await listAllPanes(env, makeExec(payload))).toEqual([
+      { paneId: "w1:p2", tabId: "w1:t2", workspaceId: "w1", hasAgent: true },
+    ]);
+  });
+
+  it("marks a pane with no agent, no agent_session and unknown status as agentless", async () => {
+    // KNOWN BLIND SPOT — this same input is also what an OCCUPIED pane looks like. Verified against a
+    // live herdr, `herdr agent start <name> -- bash` yields a pane list entry with no `agent`, no
+    // `agent_session` and agent_status "unknown": identical to an unoccupied pane. That is why
+    // occupancy is decided by the poller's `agent list` index, which DOES see it, and not by this
+    // field; `test/zombie-reaper.test.ts` pins the end-to-end consequence.
+    const payload = JSON.stringify({
+      result: { panes: [{ agent_status: "unknown", cwd: "/x", pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1" }] },
+    });
+    expect(await listAllPanes(env, makeExec(payload))).toEqual([
+      { paneId: "w1:p1", tabId: "w1:t1", workspaceId: "w1", hasAgent: false },
+    ]);
+  });
+
+  it("reports a live-observed post-exit pane (the state the reaper exists to act on) as agentless", async () => {
+    // Copied from a live `herdr pane list` entry for a pane whose Claude had exited (ids and paths
+    // replaced with placeholders, nothing else changed): no `agent`, no `agent_session`, and
+    // agent_status "unknown". `agent list` no longer reports it either, so both the pre-filter and
+    // this field agree it is free — the one shape the reap path's `hasAgent === false` must accept.
+    const payload = JSON.stringify({
+      result: {
+        panes: [{
+          agent_status: "unknown", cwd: "/x", focused: false, foreground_cwd: "/x",
+          pane_id: "w1:p2", revision: 0, tab_id: "w1:t2", terminal_id: "term_x", workspace_id: "w1",
+        }],
+      },
+    });
+    expect(await listAllPanes(env, makeExec(payload))).toEqual([
+      { paneId: "w1:p2", tabId: "w1:t2", workspaceId: "w1", hasAgent: false },
+    ]);
+  });
+
+  it("treats any positive agent signal as occupied even without an `agent` string", async () => {
+    const payload = JSON.stringify({
+      result: { panes: [{ agent_status: "idle", cwd: "/x", pane_id: "w1:p3", tab_id: "w1:t3", workspace_id: "w1" }] },
+    });
+    const panes = await listAllPanes(env, makeExec(payload));
+    expect(panes[0]!.hasAgent).toBe(true);
+  });
+
+  it("treats a lone `agent` string as occupied (no agent_session, status unknown)", async () => {
+    // A Claude that herdr has registered but not yet settled: `agent` is present while
+    // `agent_session` is still absent. Only the `agent` disjunct can catch this row.
+    const payload = JSON.stringify({
+      result: { panes: [{ agent: "claude", agent_status: "unknown", cwd: "/x", pane_id: "w1:p5", tab_id: "w1:t5", workspace_id: "w1" }] },
+    });
+    expect((await listAllPanes(env, makeExec(payload)))[0]!.hasAgent).toBe(true);
+  });
+
+  it("treats a lingering agent_session as agentless (no `agent`, status unknown)", async () => {
+    // Live-observed post-exit shape on current herdr: the pane keeps `agent_session` after Claude
+    // exits. Counting it as occupied left every such shell unreaped.
+    const payload = JSON.stringify({ result: { panes: [{ agent_status: "unknown", cwd: "/x", pane_id: "w1:p7", tab_id: "w1:t7", workspace_id: "w1",
+      agent_session: { agent: "claude", source: "herdr:claude", kind: "id", value: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" } }] } });
+    expect((await listAllPanes(env, makeExec(payload)))[0]!.hasAgent).toBe(false);
+  });
+
+  it("calls `pane list` with no --workspace flag", async () => {
+    const exec = makeExec(JSON.stringify({ result: { panes: [] } }));
+    await listAllPanes(env, exec);
+    const args = (makeExec as unknown as { lastArgs: string[] }).lastArgs;
+    expect(args).toContain("pane");
+    expect(args).toContain("list");
+    expect(args).not.toContain("--workspace");
+  });
+
+  it("returns [] on an unexpected shape rather than throwing (fail-safe: no evidence → no reap)", async () => {
+    expect(await listAllPanes(env, makeExec("{}"))).toEqual([]);
+    expect(await listAllPanes(env, makeExec(JSON.stringify({ result: { panes: [{ pane_id: "w1:p2" }] } })))).toEqual([]);
+  });
+});
+
+describe("listAllPanes — unparseable pane list warning", () => {
+  // The rate-limit Set in server/herdr.ts is module-global and keyed by env id; the "unexpected
+  // shape" test above already consumes ENVIRONMENTS[0] ("work-local"). Each test here uses an env
+  // id no earlier test has warned for, so the assertions below observe a clean rate-limit count
+  // rather than one already tripped by another test in this file.
+
+  it("warns once (rate-limited) on a malformed pane entry, matching the shape-warning text", async () => {
+    const malformedEnv = getEnv("personal-local");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const payload = JSON.stringify({ result: { panes: [{ pane_id: "w1:p2" }] } });
+      expect(await listAllPanes(malformedEnv, makeExec(payload))).toEqual([]);
+      expect(await listAllPanes(malformedEnv, makeExec(payload))).toEqual([]); // same env again
+      const matches = warn.mock.calls.flat().filter(
+        (a): a is string => typeof a === "string" && a.includes("pane list: unexpected shape"),
+      );
+      expect(matches).toHaveLength(1); // one warning total, not one per call
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("also warns when the container (result/panes) is missing outright, not just a malformed entry", async () => {
+    const missingContainerEnv = getEnv("work-remote");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      expect(await listAllPanes(missingContainerEnv, makeExec("{}"))).toEqual([]);
+      const matches = warn.mock.calls.flat().filter(
+        (a): a is string => typeof a === "string" && a.includes("pane list: unexpected shape"),
+      );
+      expect(matches).toHaveLength(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
+describe("paneSetSize", () => {
+  it("sends the control subcommand with the size, closing stdin, on a short timeout", async () => {
+    const calls: { args: readonly string[]; options: { timeout: number; closeStdin?: boolean } }[] = [];
+    const exec: ExecFn = async (_file, args, options) => {
+      calls.push({ args, options });
+      return { stdout: "", stderr: "" };
+    };
+    await paneSetSize(env, "w1:p1", 188, 45, exec);
+    expect(calls[0]!.args).toEqual([
+      "terminal", "session", "control", "w1:p1", "--cols", "188", "--rows", "45",
+    ]);
+    expect(calls[0]!.options.closeStdin).toBe(true);
+    expect(calls[0]!.options.timeout).toBe(PANE_SIZE_TIMEOUT_MS);
+  });
+
+  it("gives the remote form the house timeout, above ssh's own connect budget", async () => {
+    const calls: { options: { timeout: number } }[] = [];
+    const exec: ExecFn = async (_f, _a, options) => { calls.push({ options }); return { stdout: "", stderr: "" }; };
+    await paneSetSize(remoteEnv, "w1:p1", 188, 45, exec);
+    expect(calls[0]!.options.timeout).toBe(LIST_TIMEOUT);
+  });
+
+  describe("failure latch (decays, keyed per environment)", () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("skips an environment after its first failure, inside the cooldown", async () => {
+      const latchEnv: HerdrEnv = {
+        id: "pane-size-latch-cooldown", label: "Latch", kind: "local",
+        claudeConfigDirs: [], spawnCommand: "claude", repos: {},
+      };
+      let n = 0;
+      const exec: ExecFn = async () => { n += 1; throw new Error("unknown subcommand"); };
+      await expect(paneSetSize(latchEnv, "w1:p1", 188, 45, exec)).rejects.toThrow();
+      await paneSetSize(latchEnv, "w1:p2", 188, 45, exec);
+      expect(n).toBe(1);
+    });
+
+    it("retries once the cooldown has elapsed — a transient failure must not disable sizing forever", async () => {
+      const latchEnv: HerdrEnv = {
+        id: "pane-size-latch-retry", label: "Latch", kind: "local",
+        claudeConfigDirs: [], spawnCommand: "claude", repos: {},
+      };
+      let n = 0;
+      const exec: ExecFn = async () => { n += 1; throw new Error("protocol_mismatch"); };
+      await expect(paneSetSize(latchEnv, "w1:p1", 188, 45, exec)).rejects.toThrow();
+      vi.advanceTimersByTime(PANE_SIZE_RETRY_AFTER_MS);
+      await expect(paneSetSize(latchEnv, "w1:p2", 188, 45, exec)).rejects.toThrow();
+      expect(n).toBe(2);
+    });
+
+    it("latches per environment — a different environment's first attempt is unaffected", async () => {
+      const envA: HerdrEnv = {
+        id: "pane-size-latch-env-a", label: "A", kind: "local",
+        claudeConfigDirs: [], spawnCommand: "claude", repos: {},
+      };
+      const envB: HerdrEnv = {
+        id: "pane-size-latch-env-b", label: "B", kind: "local",
+        claudeConfigDirs: [], spawnCommand: "claude", repos: {},
+      };
+      let n = 0;
+      const exec: ExecFn = async () => { n += 1; throw new Error("unknown subcommand"); };
+      await expect(paneSetSize(envA, "w1:p1", 188, 45, exec)).rejects.toThrow();
+      await expect(paneSetSize(envB, "w1:p1", 188, 45, exec)).rejects.toThrow();
+      expect(n).toBe(2);
+    });
+  });
+});

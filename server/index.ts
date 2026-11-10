@@ -1,0 +1,169 @@
+import { serve } from "@hono/node-server";
+import { serveStatic } from "@hono/node-server/serve-static";
+import path from "node:path";
+
+import {
+  BOARD_DATA_DIR, BRIEF_ROOT, CHEAP_INTERVAL_MS, CORRAL_HOME, DIAGNOSTICS_INTERVAL_MS,
+  DIAGNOSTICS_VERSION_TTL_MS, FLEET_RESTORE_STAGGER_MS, HOST, LIST_TIMEOUT, PORT,
+  REMOTE_PROBE_ENABLED, UPDATE_CHECK_ENABLED, UPLOAD_ROOT, WS_ALLOWED_ORIGINS, ZOMBIE_REAP_ENABLED,
+  ZOMBIE_REAP_GRACE_MS,
+} from "../config.ts";
+import { createApi } from "./api.ts";
+import { createAttentionStore } from "./attention-store.ts";
+import { sweepBriefRoot } from "./brief.ts";
+import { createNodeDeps } from "./diagnostics/deps.ts";
+import { createUpdateCache } from "./diagnostics/update/cache.ts";
+import { readRepoSlug } from "./diagnostics/update/repo-slug.ts";
+import { createDiagnosticsStore } from "./diagnostics-store.ts";
+import { createDiagnosticsSweep } from "./diagnostics-sweep.ts";
+import { runLocalTool } from "./exec-tool.ts";
+import { createFleetMirror, ensureMirrorGitignore, mirrorPath } from "./fleet-mirror.ts";
+import { createFleetRestore } from "./fleet-restore.ts";
+import { createGit } from "./git.ts";
+import { closePane, defaultExec, listAllPanes, listWorkspaces, listWorkspacesStrict, paneIdentity, readPane, workspaceClose } from "./herdr.ts";
+import { assertLoopback } from "./host-guard.ts";
+import { createPoller } from "./poller.ts";
+import { formatReport, resolveReapGrace, runPreflight } from "./preflight.ts";
+import { startReconciler } from "./reconcile.ts";
+import { startRemoteMcp } from "./remote-mcp/index.ts";
+import { createTunnelStatus } from "./remote-mcp/status.ts";
+import { readSelfVersion } from "./self-version.ts";
+import { spawnSession, type SpawnOpts, type SpawnResult } from "./spawn.ts";
+import { createStorage } from "./storage.ts";
+import { readLastActivity } from "./transcript.ts";
+import { sweepUploadRoot } from "./uploads.ts";
+import { lastViewport } from "./viewport.ts";
+import { attachWebSocketServer } from "./ws-attach.ts";
+import { startZombieReaper } from "./zombie-reaper.ts";
+
+assertLoopback(HOST);
+
+// An unreachable host must not hold Ctrl-C open while the teardown's ssh calls run.
+const SHUTDOWN_GRACE_MS = 5000;
+
+const { report, envs: ENVS, configLine: preflightConfigLine } = await runPreflight();
+console.error(formatReport(report.lines));
+if (report.fatal || ENVS === null) {
+  console.error("\nFATAL: refusing to start.");
+  process.exit(1);
+}
+
+const storage = createStorage(BOARD_DATA_DIR);
+const git = createGit(BOARD_DATA_DIR);
+
+void (async () => {
+  await storage.ensureFirstRunBoard();
+  await git.ensureRepo();
+  // BEFORE git.start(): the mirror is high-churn derived state and must never enter the board
+  // store's git history (the auto-commit is `add -A`).
+  await ensureMirrorGitignore(BOARD_DATA_DIR);
+  git.start();
+  await sweepUploadRoot(UPLOAD_ROOT); // clear last run's dropped files (bounded disk use, no GC)
+  await sweepBriefRoot(BRIEF_ROOT); // same contract for MCP spawn briefs
+
+  // recap sweep is live by default (RECAP_ENABLED=true, 60s interval); set RECAP_ENABLED=false to disable
+  const attention = createAttentionStore({ dataDir: BOARD_DATA_DIR, read: readPane });
+  attention.init(); // load attention.json once at startup (§3.2)
+  const poller = createPoller({ envs: ENVS, attention });
+  // Continuous fleet mirror: subscribe before the first poll so no snapshot is missed.
+  const mirror = createFleetMirror({ dataDir: BOARD_DATA_DIR });
+  mirror.start(poller);
+  poller.start();
+  // Self-diagnostics: every check corral runs about its own install, on one contained tick. After
+  // poller.start() because the sweep reads the poller's snapshot for reachability and session state.
+  const selfVersion = readSelfVersion();
+  const diagnostics = createDiagnosticsStore({ selfVersion });
+  const tunnelStatus = createTunnelStatus();
+  const diagnosticsSweep = createDiagnosticsSweep({
+    store: diagnostics, poller, envs: ENVS, tunnels: tunnelStatus,
+    deps: createNodeDeps({ repoRoot: path.join(import.meta.dirname, "..") }),
+    corralHome: CORRAL_HOME,
+    // The config line this process actually booted with, handed over from runPreflight. Loading
+    // environments.ts a second time would return the same cached module evaluation, so a re-derived
+    // line could only ever repeat this one or describe a config the server is not running.
+    configLine: preflightConfigLine,
+    run: runLocalTool,
+    intervalMs: DIAGNOSTICS_INTERVAL_MS, versionTtlMs: DIAGNOSTICS_VERSION_TTL_MS,
+    warn: (m) => { console.error(m); },
+    probeExec: defaultExec, remoteProbeEnabled: REMOTE_PROBE_ENABLED,
+    // The cache is vetted once, here, rather than on every tick: a hostile or unusable directory is a
+    // permanent condition for this run, and re-deciding it 1440 times a day would only add noise.
+    updateIo: {
+      enabled: UPDATE_CHECK_ENABLED,
+      version: selfVersion,
+      repoSlug: () => readRepoSlug(),
+      fetch: (url, init) => fetch(url, init),
+      cache: createUpdateCache(),
+    },
+  });
+  if (DIAGNOSTICS_INTERVAL_MS > 0) diagnosticsSweep.start();
+  // Backfill stored links' Claude sessionId once the poller sees it (spawned links start null) — the
+  // write-side half of persistent session identity; buildBoardState does the read-side churn-heal.
+  startReconciler({ poller, storage });
+  // Close shell-only panes left behind when a Claude session exits (detached link whose herdr pane still
+  // lingers). The ONLY place the poll loop mutates herdr — gated, guarded, and via pane close only.
+  // Clamp + warning sit inside the gate: with the reaper off there is nothing to clamp or warn about.
+  if (ZOMBIE_REAP_ENABLED) {
+    const reapGrace = resolveReapGrace(ZOMBIE_REAP_GRACE_MS, CHEAP_INTERVAL_MS, LIST_TIMEOUT);
+    if (reapGrace.message !== null) console.error(reapGrace.message);
+    startZombieReaper({ poller, storage, envs: ENVS, listPanes: listAllPanes, closePane, graceMs: reapGrace.ms });
+  }
+
+  const spawn = (opts: SpawnOpts): Promise<SpawnResult> => {
+    const viewport = lastViewport();
+    return spawnSession({
+      ...opts,
+      workspaceListFn: listWorkspaces,
+      workspaceListStrictFn: listWorkspacesStrict,
+      workspaceCloseFn: workspaceClose,
+      // Read here, not inside spawn.ts: that module takes its herdr dependencies by injection, so
+      // process state is resolved here.
+      ...(viewport === null ? {} : { paneSize: viewport }),
+    });
+  };
+  const fleetRestore = createFleetRestore({
+    envs: ENVS,
+    mirrorFilePath: mirrorPath(BOARD_DATA_DIR),
+    spawn,
+    staggerMs: FLEET_RESTORE_STAGGER_MS,
+  });
+
+  const app = createApi({
+    poller, envs: ENVS, storage,
+    listWorkspaces,
+    lastActivity: readLastActivity,
+    allowedOrigins: WS_ALLOWED_ORIGINS,
+    spawn,
+    fleetRestore,
+    diagnostics,
+    // `sweep.refresh`, not `tick`: the operator's re-check must post-date the request, so it waits out
+    // the run in flight and then runs once more with the version TTL bypassed.
+    refreshDiagnostics: diagnosticsSweep.refresh,
+  });
+  app.use("/*", serveStatic({ root: "./web/dist" })); // built frontend (Task 13+); absent in dev — harmless
+
+  const server = serve({ fetch: app.fetch, hostname: HOST, port: PORT }, (info) => {
+    console.warn(`herdr-dashboard listening on http://${info.address}:${String(info.port)}`);
+  });
+  // Live-terminal WS attach rides the same loopback-only http server (assertLoopback above). SEC-1
+  // Origin allowlist + SEC-2 rate/cap + SEC-3 reaping are all enforced inside attachWebSocketServer.
+  attachWebSocketServer(server, {
+    envs: ENVS, allowedOrigins: WS_ALLOWED_ORIGINS,
+    onViewed: (env, paneId) => { if (attention.clearFinished(`${env.id}:${paneId}`)) void poller.refreshEnv(env.id); },
+  });
+
+  // After the http server is listening: a shim's first call resolves identity over that loopback.
+  const stopRemoteMcp = await startRemoteMcp({
+    envs: ENVS, poller, storage, paneLookup: paneIdentity,
+    baseUrl: `http://127.0.0.1:${String(PORT)}`,
+    intervalMs: CHEAP_INTERVAL_MS, status: tunnelStatus,
+  });
+  for (const signal of ["SIGINT", "SIGTERM"] as const) {
+    process.once(signal, () => {
+      // Awaited: the teardown is an ssh round trip, and exiting in the same tick would skip it.
+      const done = stopRemoteMcp().catch(() => undefined);
+      const deadline = new Promise((r) => setTimeout(r, SHUTDOWN_GRACE_MS));
+      void Promise.race([done, deadline]).then(() => { process.exit(0); });
+    });
+  }
+})();

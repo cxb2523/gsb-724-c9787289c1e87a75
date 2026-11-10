@@ -1,0 +1,1771 @@
+import {
+  type Board, type BoardState, type EnrichedTask,
+  type GlobalState, type SessionLink, type Task,
+  ColumnSchema,
+  DEFAULT_COLUMNS,
+  LOG_ENTRY_TEXT_MAX,
+  LogKindSchema,
+  logTooLong,
+  defaultColumnId,
+  generateLogEntryId,
+  generateTaskId,
+  nowSecs,
+  slugifyBoardId,
+  sortTasks,
+  toBoardFrame,
+} from "@shared/board-schema.ts";
+import { descriptionRev } from "@shared/description-rev.ts";
+import type { DiagnosticsSnapshot } from "@shared/diagnostics-schema";
+import { emptyDiagnostics } from "@shared/diagnostics-schema";
+import type { AttentionMap, PaneRead, SessionRow, Snapshot } from "@shared/schema";
+import { MoveTaskRequestSchema, UPLOAD_MAX_BYTES } from "@shared/schema";
+import type { Context } from "hono";
+import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
+import { streamSSE } from "hono/streaming";
+import { z } from "zod";
+
+import {
+  AMBIENT_HERDR_SOCKET, BOARD_DESCRIPTION_MAX_CHARS, BRIEF_CLEANUP_DELAY_MS, BRIEF_MAX_BYTES, BRIEF_ROOT, READ_CACHE_TTL_MS,
+  SPAWN_TIMEOUT_MS, TASK_DESCRIPTION_MAX_CHARS, UPLOAD_ROOT, WS_ALLOWED_ORIGINS,
+} from "../config.ts";
+import type { HerdrEnv } from "../environments.ts";
+import { briefByteLength, cleanupBrief, composeBrief, START_COMMAND_FALLBACK, writeBrief } from "./brief.ts";
+import { cardSignal } from "./card-signal.ts";
+import { syncClaudeThemeBase, syncRemoteClaudeThemeBase, ThemeModeSchema } from "./claude-theme.ts";
+import type { DiagnosticsStore } from "./diagnostics-store.ts";
+import type { FleetRestore } from "./fleet-restore.ts";
+import { closePane, listWorkspaces, paneIdentity, readPane, type ReadFn, UUID_RE } from "./herdr.ts";
+import { isLoopbackHost } from "./host-guard.ts";
+import { displacingName } from "./link-name.ts";
+import { buildLiveIndex, resolveLiveRow } from "./live-resolve.ts";
+import type { Poller } from "./poller.ts";
+import { writeRemoteFile } from "./remote-write.ts";
+import { isSessionBound, linkBindsSession, resolveLinkIndex } from "./session-binding.ts";
+import { composeSessionName, fallbackNamePrefix, NAME_MAX, sanitizeSlug, slugify } from "./spawn.ts";
+import type { SpawnOpts, SpawnResult } from "./spawn.ts";
+import { aggregateAccounts } from "./statusline.ts";
+import type { Storage } from "./storage.ts";
+import { appendLogEntry, resolveLogSource, resolveWriter, sessionRef, stampSystem } from "./task-log.ts";
+import { readLastActivity, readSessionCwd } from "./transcript.ts";
+import { createTtlCache } from "./ttl-cache.ts";
+import { sanitizeUploadName, writeUploadFile } from "./uploads.ts";
+import type { PaneIdentity } from "./whoami.ts";
+import { buildWhoami, resolveSelf, resolveSelfViaPane } from "./whoami.ts";
+import { PANE_RE } from "./ws-attach-guard.ts";
+
+const BID_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
+const TID_RE = /^t_[A-Za-z0-9_-]{7}$/;
+// herdr workspace ids (e.g. "w8", "w6555cedb91c1d3"). Must not start with '-' (option-injection into
+// `--workspace <id>`); matches the BID_RE/TID_RE/PANE_RE guard discipline for client-supplied ids.
+const WS_RE = /^[A-Za-z0-9][A-Za-z0-9:_-]{0,63}$/;
+const LAST_ACTIVE_TTL_MS = 60_000;
+// How long a ?deferred=1 close waits after responding before killing the pane. Long enough for the
+// HTTP response to flush to the MCP client, short enough that the operator sees the pane die "now".
+const CLOSE_DEFER_MS = 150;
+// Floor under POST /api/diagnostics/refresh: within this window the route answers from the store
+// without re-running. That route is the only one an unauthenticated caller can use to make the server
+// spawn processes on demand — the loopback bind is the whole access control, and a cross-origin POST is
+// a CORS-simple request the browser delivers even though the page cannot read the reply. The sweep
+// already serializes its work (one run at a time, never N queued), so this is not the primary defense;
+// it turns a request loop from N sweeps in sequence into a no-op.
+const REFRESH_MIN_INTERVAL_MS = 2000;
+
+export type SpawnFn = (opts: SpawnOpts) => Promise<SpawnResult>;
+
+// ---------- board/task helpers ----------
+
+function buildUnassigned(storage: Storage | undefined, snapshot: Snapshot): SessionRow[] {
+  if (storage === undefined) return [];
+  const allBoards = storage.getAllBoards();
+  const assignedPanes = new Set<string>();
+  const assignedSessions = new Set<string>();
+  for (const board of allBoards) {
+    for (const task of board.tasks) {
+      for (const link of task.sessions) {
+        // Keep this pool the complement of buildBoardState's binding — a live session is unassigned iff no
+        // card binds it (holds while live session UUIDs are unique per env, the same assumption
+        // buildBoardState's bySession index already makes). A link WITH a sessionId binds that UUID's live
+        // row, NOT whatever now holds its stored paneId, so it claims ONLY by sessionId: also claiming the
+        // paneId would hide a same-pane `/new` replacement (pane keeps its id, gets a NEW uuid; the stale
+        // link resolves by sessionId → detached). Churn (stale paneId, stable uuid at a new pane) stays
+        // excluded. A link WITHOUT a sessionId is legacy/best-effort → claim by paneId, as buildBoardState
+        // binds it. (A live row whose sessionId is briefly null mid-`/new` surfaces to the pool by design.)
+        if (link.sessionId !== null && link.sessionId !== "") assignedSessions.add(`${link.env}:${link.sessionId}`);
+        else assignedPanes.add(`${link.env}:${link.paneId}`);
+      }
+    }
+  }
+  return snapshot.sessions.filter((s) =>
+    !assignedPanes.has(`${s.env}:${s.paneId}`) &&
+    (s.sessionId === null || !assignedSessions.has(`${s.env}:${s.sessionId}`)));
+}
+
+function buildBoardState(board: Board, storage: Storage, snapshot: Snapshot, attention: AttentionMap, diagnostics: DiagnosticsSnapshot): BoardState {
+  const index = buildLiveIndex(snapshot.sessions);
+
+  // `log` is destructured OUT rather than the other fields being listed in: this frame goes to every
+  // open board on every poll tick, and a spread would put the whole log on every one of them. Naming
+  // only what must not ride keeps the omission the compiler checks — EnrichedTaskSchema is
+  // TaskSchema.omit({ log }) extended, so a field added to the card reaches the web without anyone
+  // remembering to add it here, while `log` still cannot. The counters are the frame's whole account
+  // of the log — what the card's badge reads (web/src/components/TaskCard.tsx) without the entries.
+  const enrichedTasks: EnrichedTask[] = sortTasks(board.tasks).map(({ log, ...task }) => ({
+    ...task,
+    logCount: log.length,
+    noteCount: log.filter((e) => e.kind === "note").length,
+    lastLogAtMs: log.at(-1)?.atMs ?? null,
+    sessions: task.sessions.map((link) => {
+      // Resolve the live row. When the link carries a stable sessionId, TRUST IT over the stored
+      // paneId: a herdr restart reassigns paneIds, so the stored paneId may now belong to a *different*
+      // session — a paneId hit whose sessionId disagrees is a stale reuse, not ours. So we take the
+      // paneId hit only when it has no sessionId to contradict us; otherwise (miss, or hit with a
+      // mismatched id) we resolve by the sessionId index and override the enriched paneId with the live
+      // row's current one. A sessionId that resolves to nothing → detached (our session is gone), never
+      // mis-bound to whoever now holds the pane. Without a sessionId we fall back to the plain paneId
+      // hit (best-effort, legacy links). Non-destructive: the stored link is untouched (the reconciler
+      // owns write-side backfill); we only heal what we serve. paneId is NOT unique within a task: after
+      // a same-pane `/new`, a detached link (old uuid) and a live link (new uuid) both enrich to the
+      // reused paneId. React-key uniqueness rests on TaskCard's sessionId-inclusive key
+      // (web/src/components/TaskCard.tsx), and every paneId-keyed write resolves the specific link by
+      // sessionId (server/session-binding.ts).
+      const live = resolveLiveRow(link, index);
+      const paneId = live?.paneId ?? link.paneId;
+      // Bound first, then tested for empty, so a degenerate name FALLS THROUGH to the tab label rather
+      // than ending the chain rendering "" — the one value a card must never show.
+      const claudeName = live === undefined ? "" : displacingName(live);
+      return {
+        ...link,
+        paneId,
+        // For a LIVE session the herdr row carries the CURRENT labels, so prefer them — a tab rename or
+        // workspace move then shows immediately. The stored link labels are only a bind-time snapshot
+        // (they go stale on rename) and are the source of truth for nothing that's displayed: they serve
+        // ONLY as a fallback when there is no live row (detached) or the live label is unknown ("?"/"").
+        // `name` is rendered on the live card as well as the detached one, so it prefers the LIVE
+        // registry name — the same way tabLabel prefers the live herdr label. Gated on claudeNameUserSet
+        // exactly as the tab renamer (server/tab-namer.ts) and the fleet mirror are: a Claude auto-name
+        // must not displace a label the operator set by hand, or the board and the terminal would
+        // disagree permanently — nothing would ever push that name onto the tab. Then the LIVE tab label,
+        // because the stored link.name is only a bind-time snapshot and the reconciler refreshes it for
+        // user-set names alone; then the stored name; then paneId, which heals a record persisted empty.
+        tabLabel: live !== undefined && live.tab !== "" && live.tab !== "?" ? live.tab : link.tabLabel,
+        workspaceLabel: live !== undefined && live.workspace !== "" && live.workspace !== "?" ? live.workspace : link.workspaceLabel,
+        name: claudeName !== "" ? claudeName
+          : live !== undefined && live.tab !== "" && live.tab !== "?" ? live.tab
+          : link.name !== "" ? link.name : paneId,
+        live: live !== undefined
+          ? { status: live.status, model: live.statusline?.model ?? null,
+              ctxPct: live.statusline?.ctx.pct !== null && live.statusline?.ctx.pct !== undefined
+                ? String(live.statusline.ctx.pct) : null,
+              detached: false, recap: live.recap, recapAt: live.recapAt,
+              recapStatus: live.recapStatus, recapSource: live.recapSource, statusline: live.statusline,
+              claudeStatus: live.claudeStatus, claudeName: live.claudeName, waitingFor: live.waitingFor,
+              remoteControl: live.remoteControl, registryStatus: live.registryStatus }
+          : { status: "unknown", model: null, ctxPct: null, detached: true,
+              recap: null, recapAt: null, recapStatus: null, recapSource: null, statusline: null,
+              claudeStatus: null, claudeName: null, waitingFor: null, remoteControl: null, registryStatus: null },
+      };
+    }),
+  }));
+
+  return {
+    // Same reason as the explicit list above, and not redundant with it: `board` carries its own copy
+    // of the task list, so leaving it whole would ship every log on every tick through the other half
+    // of the frame.
+    board: toBoardFrame(board),
+    tasks: enrichedTasks,
+    unassigned: buildUnassigned(storage, snapshot),
+    envs: snapshot.envs,
+    attention,
+    accounts: aggregateAccounts(snapshot.sessions),
+    // Set HERE, not only on the board-less payload: this function builds every board SSE frame and the
+    // `/api/state?board=…` response, which is the one path the web actually fetches. Omitted, the field
+    // would arrive as the schema's all-zero default — a green rail asserting health nobody measured.
+    diagnostics,
+  };
+}
+
+// ---------- request body schemas ----------
+
+const CreateBoardBodySchema = z.object({
+  label: z.string().min(1),
+});
+
+// PATCH-BOUNDARY constraints — deliberately NOT in BoardSchema (server/storage.ts parses stored
+// boards with .parse, so a constraint there would make a bad board unloadable).
+//
+// The leading-character rule is load-bearing, not cosmetic: the command's bytes become one positional
+// argv word for `claude`, and quoting protects that word from the SHELL, not from Claude Code's
+// argument parser. A preset starting with `-` is read as an option, never as the prompt. Same rule,
+// same reason, as the `model` field on the spawn route.
+//
+// The whitelist is deliberately NARROWER than that hazard: only `/` and ASCII alphanumerics pass, so a
+// command opening with a non-Latin letter, `#` or `@` is refused too. That is a decision, not an
+// oversight — do not widen it to a `-` blacklist without re-taking it. The message says what IS
+// accepted, because a refusal that only names the flag hazard reads as a bug for every input that is
+// not a flag.
+const START_COMMAND_FIRST_CHAR = /^[/A-Za-z0-9]/;
+const START_COMMAND_FIRST_CHAR_MESSAGE =
+  'must begin with "/" or an ASCII letter or digit — the first character is restricted so a leading "-" cannot reach the CLI as a flag';
+const SpawnPresetPatchSchema = z.object({
+  id: z.string().min(1),
+  text: z.string().trim().min(1).max(2000).regex(START_COMMAND_FIRST_CHAR, START_COMMAND_FIRST_CHAR_MESSAGE),
+});
+
+const PatchBoardBodySchema = z.object({
+  label: z.string().min(1).optional(),
+  columns: z.array(ColumnSchema).optional(),
+  description: z.string().trim().max(BOARD_DESCRIPTION_MAX_CHARS, `description exceeds ${String(BOARD_DESCRIPTION_MAX_CHARS)} characters`).optional(),
+  spawnPresets: z.array(SpawnPresetPatchSchema).max(20).optional(),
+  defaultSpawnPresetId: z.string().nullable().optional(),
+});
+// Shared by every route that accepts a description. The message points at the operator rather than
+// saying "shorten it" because a session cannot shorten what corral_task_read did not show it.
+const DescriptionInputSchema = z.string().max(
+  TASK_DESCRIPTION_MAX_CHARS,
+  `description exceeds ${String(TASK_DESCRIPTION_MAX_CHARS)} characters — the card states the task, not the work done on it. Cut what a durable carrier already records; if the existing text is longer than you were shown, ask the operator rather than rewriting from a partial view.`,
+);
+
+
+const CreateTaskBodySchema = z.object({
+  title: z.string().min(1),
+  // No literal default: a task created with no status must land in THIS board's landing column,
+  // which the route resolves inside withBoard (mirrors FromSessionBodySchema) since only the loaded
+  // board knows it.
+  status: z.string().optional(),
+  priority: z.enum(["p0", "p1", "p2", "p3"]).nullable().optional(),
+  description: DescriptionInputSchema.optional(),
+  // Provenance for the card's FIRST log entry (corral_task_create). `env`/`paneId` name the creating
+  // session; `sourceBoardId`/`sourceTaskId` the card it follows up. All optional: the web "add task"
+  // omits them and the `created` entry is stamped without a session named. Placed in the log, never
+  // in `description` — description is a full-replacement write and would erase provenance on its first
+  // rewrite (design §7).
+  env: z.string().optional(),
+  paneId: z.string().optional(),
+  sourceBoardId: z.string().optional(),
+  sourceTaskId: z.string().optional(),
+});
+
+
+const PatchTaskBodySchema = z.object({
+  title: z.string().min(1).optional(),
+  status: z.string().optional(),
+  priority: z.enum(["p0", "p1", "p2", "p3"]).nullable().optional(),
+  description: DescriptionInputSchema.optional(),
+});
+
+// The MCP's write path: a description rewrite must name the revision it was read at.
+const EditTaskBodySchema = PatchTaskBodySchema.extend({ baseRev: z.string().optional() }).refine(
+  (b) => (b.description === undefined) === (b.baseRev === undefined),
+  { message: "baseRev is required with description, and only with it" },
+);
+
+/**
+ * The append body. Not a PATCH of the task, and that is the point: a PATCH carries last-write-wins
+ * semantics for `description`, and routing the log through it would drag the log into that semantics
+ * and reintroduce the lost update the append-only shape exists to prevent.
+ *
+ * `at` is absent by construction — the server stamps it. A caller-supplied timestamp would let one
+ * session's entry sort ahead of everything already written.
+ *
+ * `kind` is restricted to `note` for now: every other kind is a system event corral stamps itself on
+ * the route that caused it, so accepting one here would let a session forge a lifecycle line.
+ */
+const AppendLogBodySchema = z.object({
+  kind: LogKindSchema.extract(["note"]),
+  // The length cap is applied below with a message that says by how much, not here as a schema
+  // bound; the min() is what makes "wrote nothing" an error instead of an entry saying nothing.
+  text: z.string().trim().min(1),
+  env: z.string(),
+  paneId: z.string(),
+});
+
+const AttachBodySchema = z.object({
+  env: z.string(),
+  paneId: z.string(),
+  tabId: z.string().default(""),
+  tabLabel: z.string().default(""),
+  workspaceId: z.string().default(""),
+  workspaceLabel: z.string().default(""),
+  name: z.string().default(""),
+  cwdSnapshot: z.string().default(""),
+});
+
+const DetachBodySchema = z.object({
+  env: z.string(),
+  paneId: z.string(),
+  // Which of possibly-several same-pane links to unlink. Omitted by legacy callers → null → paneId
+  // resolution (+ churn-heal), the prior behavior.
+  sessionId: z.string().nullable().default(null),
+});
+
+// Body of POST /api/fleet/restore (server-only boundary; the response shape lives in shared/schema.ts).
+const FleetRestoreRequestSchema = z.object({
+  env: z.string().optional(),
+  dryRun: z.boolean().optional(),
+});
+
+const FromSessionBodySchema = z.object({
+  title: z.string().min(1),
+  // No literal default: a card created from an unassigned session must land in THIS board's landing
+  // column, which the route resolves inside withBoard (it needs the loaded board to know it).
+  status: z.string().optional(),
+  priority: z.enum(["p0", "p1", "p2", "p3"]).nullable().optional(),
+  description: DescriptionInputSchema.optional(),
+  env: z.string(),
+  paneId: z.string(),
+  tabId: z.string().default(""),
+  tabLabel: z.string().default(""),
+  workspaceId: z.string().default(""),
+  workspaceLabel: z.string().default(""),
+  name: z.string().default(""),
+  cwdSnapshot: z.string().default(""),
+});
+
+export function createApi(opts: {
+  poller: Poller;
+  envs: readonly HerdrEnv[];
+  read?: ReadFn;
+  storage?: Storage;
+  spawn?: SpawnFn;
+  listWorkspaces?: (env: HerdrEnv) => Promise<{ workspace_id: string; label: string }[]>;
+  lastActivity?: (env: HerdrEnv, sessionId: string) => Promise<number | null>;
+  sessionCwd?: (env: HerdrEnv, sessionId: string) => Promise<string | null>;
+  closePaneFn?: (env: HerdrEnv, paneId: string) => Promise<void>;
+  // Pane-level identity lookup, used only when the snapshot cannot resolve the caller (see the
+  // whoami route). Injectable so the fallback is testable without a live herdr.
+  paneIdentityFn?: (env: HerdrEnv, paneId: string) => Promise<PaneIdentity | null>;
+  closeDeferMs?: number; // injectable so the deferred-close ordering is testable without real waits
+  spawnTimeoutMs?: number; // injectable so the timeout-cleanup path is testable without a 60s wait
+  allowedOrigins?: readonly string[]; // Origin allowlist for the file-upload route (default WS_ALLOWED_ORIGINS)
+  syncRemoteTheme?: typeof syncRemoteClaudeThemeBase; // remote theme sync over ssh (injectable so tests need no ssh)
+  writeRemote?: typeof writeRemoteFile; // remote file write over ssh (injectable so tests need no ssh)
+  uploadRoot?: string; // drop-upload temp root (injectable so tests write to a scratch dir)
+  briefRoot?: string; // spawn-brief root (injectable so tests write to a scratch dir)
+  briefCleanupDelayMs?: number; // injectable so the post-spawn brief unlink is testable without a real wait
+  fleetRestore?: FleetRestore;
+  // Self-diagnostics. OPTIONAL, like every option above: a harness (or a build with the sweep off) that
+  // wires neither still serves frames, with an EMPTY snapshot — `answered: []`, which reads as "nothing
+  // has looked", never as "all clear" — and both diagnostics routes answer 503.
+  diagnostics?: DiagnosticsStore;
+  refreshDiagnostics?: () => Promise<void>;
+}): Hono {
+  const read = opts.read ?? readPane;
+  const listWs = opts.listWorkspaces ?? listWorkspaces;
+  const lastActivity = opts.lastActivity ?? readLastActivity;
+  const sessionCwd = opts.sessionCwd ?? readSessionCwd;
+  const closePaneFn = opts.closePaneFn ?? closePane;
+  const paneLookup = opts.paneIdentityFn ?? paneIdentity;
+  const closeDeferMs = opts.closeDeferMs ?? CLOSE_DEFER_MS;
+  const spawnTimeoutMs = opts.spawnTimeoutMs ?? SPAWN_TIMEOUT_MS;
+  const allowedOrigins = opts.allowedOrigins ?? WS_ALLOWED_ORIGINS;
+  const uploadRoot = opts.uploadRoot ?? UPLOAD_ROOT;
+  const writeRemote = opts.writeRemote ?? writeRemoteFile;
+  const syncRemoteTheme = opts.syncRemoteTheme ?? syncRemoteClaudeThemeBase;
+  const briefRoot = opts.briefRoot ?? BRIEF_ROOT;
+  const briefCleanupDelayMs = opts.briefCleanupDelayMs ?? BRIEF_CLEANUP_DELAY_MS;
+  // Last-active timestamps (transcript-derived); caches `null` too (no transcript). Bounded + TTL'd.
+  const laCache = createTtlCache<number | null>({ ttlMs: LAST_ACTIVE_TTL_MS });
+  // #4: coalesce sub-second /read bursts (each is a herdr/SSH round-trip). Success-only; keyed by the
+  // CLAMPED lines so distinct line counts stay independent.
+  const readCache = createTtlCache<PaneRead>({ ttlMs: READ_CACHE_TTL_MS });
+  const diagnosticsSnapshot = (): DiagnosticsSnapshot => opts.diagnostics?.snapshot() ?? emptyDiagnostics();
+  // When the last refresh FINISHED, per createApi instance. Measured from the end of the work so the
+  // floor spaces out sweeps rather than requests.
+  let lastRefreshAt = 0;
+  const app = new Hono();
+
+  // Anti-DNS-rebinding (SEC): the loopback bind is the only access control, but a rebound page becomes
+  // same-origin and could drive the whole API. Reject any request whose Host is PRESENT and non-loopback
+  // (the rebinding vector — a browser always sends its own Host and cannot forge/omit it). A missing
+  // Host is not a browser and thus not a rebinding attack (some local CLI/HTTP-1.0 clients omit it), so
+  // it's allowed. Mounted first so it covers every route below. The WS attach upgrade is guarded
+  // separately at the raw Node `upgrade` handler (origin-allowlisted), so this middleware never sees it.
+  app.use("*", async (c, next) => {
+    const host = c.req.header("host");
+    if (host !== undefined && host !== "" && !isLoopbackHost(host)) {
+      return c.json({ error: { code: "forbidden", message: "non-loopback Host rejected" } }, 403);
+    }
+    return next();
+  });
+
+  app.get("/api/health", (c) => c.json({ ok: true }));
+
+  // A remote that cannot be reached is logged and skipped so it never fails the toggle.
+  app.post("/api/theme", async (c) => {
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return c.json({ error: { code: "validation", message: "invalid JSON" } }, 400); }
+    const parsed = z.object({ mode: ThemeModeSchema }).safeParse(body);
+    if (!parsed.success) return c.json({ error: { code: "validation", message: "mode must be 'light' or 'dark'" } }, 400);
+    const dirs = [...new Set(opts.envs.filter((e) => e.kind === "local").flatMap((e) => [...e.claudeConfigDirs]))];
+    const remotes = opts.envs.filter((e) => e.kind === "remote");
+    const counts = await Promise.all([
+      syncClaudeThemeBase(dirs, parsed.data.mode),
+      ...remotes.map((e) => syncRemoteTheme(e, parsed.data.mode).catch((err: unknown) => {
+        console.warn(`[theme] env=${e.id} sync failed: ${err instanceof Error ? err.message : String(err)}`);
+        return 0;
+      })),
+    ]);
+    return c.json({ ok: true, updated: counts.reduce((a, b) => a + b, 0) });
+  });
+
+  app.get("/api/state", (c) => {
+    const boardId = c.req.query("board");
+    if (boardId !== undefined && opts.storage !== undefined) {
+      const board = opts.storage.getBoard(boardId);
+      if (board === null) return c.json({ error: { code: "not_found" } }, 404);
+      return c.json(buildBoardState(board, opts.storage, opts.poller.getSnapshot(), opts.poller.getAttention(), diagnosticsSnapshot()));
+    }
+    return c.json(opts.poller.getSnapshot());
+  });
+
+  // Identity for an MCP client running inside a herdr pane. The caller supplies only hints
+  // (paneId/cwd/socket); the authoritative data is the poller snapshot plus the trusted env config.
+  // SECURITY: `socket` is used ONLY to disambiguate which configured environment the caller sits in.
+  // It is NEVER used to route a herdr call — routing always keys on the resolved env id from the
+  // startup config, so a forged value can at worst fail to resolve (spec §4).
+  app.get("/api/whoami", async (c) => {
+    const paneId = c.req.query("paneId");
+    if (paneId === undefined) {
+      return c.json({ error: { code: "validation", message: "paneId required" } }, 400);
+    }
+    // Distinct from absent: a value that cannot be a pane id is a caller bug, and "paneId required"
+    // sent someone looking for a missing parameter they had in fact supplied.
+    if (!PANE_RE.test(paneId)) {
+      return c.json({ error: { code: "validation", message: "malformed paneId" } }, 400);
+    }
+    const cwd = c.req.query("cwd") ?? "";
+    const socket = c.req.query("socket") ?? null;
+    const resolve = (): { snapshot: Snapshot; resolution: ReturnType<typeof resolveSelf> } => {
+      const snapshot = opts.poller.getSnapshot();
+      return {
+        snapshot,
+        resolution: resolveSelf({ snapshot, envs: opts.envs, paneId, cwd, socket, ambientSocket: AMBIENT_HERDR_SOCKET }),
+      };
+    };
+
+    // The caller is asking about a pane that, by definition, it is sitting in RIGHT NOW, so an
+    // unresolved answer almost always means corral has not caught up rather than that the pane is
+    // bogus. Two escalating recoveries, both only on the miss path:
+    //
+    //   1. Re-poll the local environments. The cheap poll runs every 30s by default, so the snapshot
+    //      routinely predates a pane created seconds ago — and a spawned session is told to call this
+    //      tool as its very first action. Each refresh shares that environment's interval guard, so
+    //      it collapses into a tick already running rather than racing it.
+    //   2. Ask herdr about the PANE directly. The snapshot only holds panes with a registered Claude
+    //      agent, so re-polling cannot help a pane whose Claude is still booting. paneIdentity sees
+    //      it anyway, and the synthesized row resolves the card immediately — metrics fill in later.
+    //
+    // Each runs at most once, so the worst case is one extra poll plus one pane lookup per request.
+    let { snapshot, resolution } = resolve();
+    if (!resolution.ok) {
+      await Promise.all(opts.envs.filter((e) => e.kind === "local").map((e) => opts.poller.refreshEnv(e.id)));
+      ({ snapshot, resolution } = resolve());
+    }
+    // Only a not_found escalates: an ambiguous match already found real rows, and replacing them
+    // with a synthesized one would silently drop the caller's metrics AND hide the ambiguity.
+    if (!resolution.ok && resolution.code === "not_found") {
+      resolution = await resolveSelfViaPane({
+        envs: opts.envs, paneId, socket, ambientSocket: AMBIENT_HERDR_SOCKET, lookup: paneLookup,
+      });
+    }
+    return c.json(buildWhoami({
+      resolution,
+      envs: opts.envs,
+      snapshot,
+      boards: opts.storage === undefined ? [] : opts.storage.getAllBoards(),
+    }));
+  });
+
+  // Card-empty check for scripts/corral-claude-hook.sh — see
+  // docs/adr/0007-a-pane-side-hook-becomes-an-http-client-of-the-corral-api.md. Same request shape
+  // as /api/whoami, deliberately no `env` parameter — see that route's comment. Deliberately WITHOUT
+  // whoami's two escalating recoveries on a resolution miss (re-poll, then pane lookup): this route
+  // is hit on every prompt of every session, so it reads the current snapshot once and answers —
+  // the cost is a miss on a session's very first prompt, recovered on the next one. `getAllBoards()`
+  // throws on a malformed board file (server/storage.ts), UPSTREAM of the pure cardSignal, so the
+  // try/catch has to live here.
+  app.get("/api/card-signal", (c) => {
+    const paneId = c.req.query("paneId");
+    if (paneId === undefined) {
+      return c.json({ error: { code: "validation", message: "paneId required" } }, 400);
+    }
+    if (!PANE_RE.test(paneId)) {
+      return c.json({ error: { code: "validation", message: "malformed paneId" } }, 400);
+    }
+    if (opts.storage === undefined) return c.json({ empty: false });
+    const cwd = c.req.query("cwd") ?? "";
+    const socket = c.req.query("socket") ?? null;
+    let boards: Board[];
+    try {
+      boards = opts.storage.getAllBoards();
+    } catch {
+      return c.json({ empty: false });
+    }
+    const snapshot = opts.poller.getSnapshot();
+    return c.json(cardSignal(boards, snapshot, opts.envs, { paneId, cwd, socket }, AMBIENT_HERDR_SOCKET));
+  });
+
+  // Attention records for the fleet digest. The bare GET /api/state returns a plain Snapshot with no
+  // attention (it rides only the ?board= branch and the SSE frames), so rather than change that shape
+  // attention gets its own read-only route.
+  app.get("/api/attention", (c) => c.json(opts.poller.getAttention()));
+
+  // Read-only: the sweep publishes into the store on its own cadence, and this hands back whatever is
+  // there. 503 rather than an empty snapshot when nothing is wired — an all-zero rollup on this route
+  // would be indistinguishable from a clean bill of health.
+  app.get("/api/diagnostics", (c) =>
+    opts.diagnostics === undefined
+      ? c.json({ error: { code: "unavailable" } }, 503)
+      : c.json(opts.diagnostics.snapshot()));
+
+  // Operator "re-check now": awaits the run in flight, then runs once more with the version TTL
+  // bypassed, so the answer post-dates the request ("unchanged" and "not re-checked" must not look
+  // alike to someone verifying a fix). Throttled callers still get 200 with the current snapshot — they
+  // asked a question that has an answer; they just don't get to start the work again. See
+  // REFRESH_MIN_INTERVAL_MS.
+  app.post("/api/diagnostics/refresh", async (c) => {
+    const refresh = opts.refreshDiagnostics;
+    if (refresh === undefined) return c.json({ error: { code: "unavailable" } }, 503);
+    if (Date.now() - lastRefreshAt >= REFRESH_MIN_INTERVAL_MS) {
+      // Stamped twice on purpose. Before the await it shuts the window on requests that arrive WHILE the
+      // sweep runs — a client loop that never awaits would otherwise sail past a finish-only stamp and
+      // queue one sweep per request. After it, so the interval is measured from completion.
+      lastRefreshAt = Date.now();
+      await refresh();
+      lastRefreshAt = Date.now();
+    }
+    return c.json(diagnosticsSnapshot());
+  });
+
+  app.get("/api/stream", (c) => {
+    // Reverse proxies buffer responses by default (nginx's `proxy_buffering on`): they forward only
+    // FULL buffers and hold the trailing partial one — which is exactly where an SSE frame's
+    // terminating blank line sits. EventSource cannot dispatch a frame without that blank line, so a
+    // proxied client renders NOTHING until the next poller tick writes enough bytes to flush the
+    // tail: an empty board for a whole poll interval, with a first frame the server logged as sent
+    // in single-digit milliseconds. This header is the standard opt-out and nginx honours it unless
+    // the operator explicitly ignores it. Cheap insurance for every reverse proxy, not just nginx.
+    c.header("X-Accel-Buffering", "no");
+    return streamSSE(c, async (stream) => {
+      const boardId = new URL(c.req.url).searchParams.get("board") ?? undefined;
+      let writing = false;
+
+      // Every frame must parse under the client's StreamFrameSchema (useEventSource silently drops
+      // frames that don't). No/unknown board → the GlobalState shape, NOT a bare Snapshot, so the
+      // attention feed and unassigned list keep updating on that view.
+      function buildPayload(s: Snapshot): BoardState | GlobalState {
+        if (boardId !== undefined && opts.storage !== undefined) {
+          const board = opts.storage.getBoard(boardId);
+          if (board !== null) return buildBoardState(board, opts.storage, s, opts.poller.getAttention(), diagnosticsSnapshot());
+        }
+        return { unassigned: buildUnassigned(opts.storage, s), envs: s.envs, attention: opts.poller.getAttention(), accounts: aggregateAccounts(s.sessions), diagnostics: diagnosticsSnapshot() };
+      }
+
+      const send = (s: Snapshot): void => {
+        if (writing) return;
+        writing = true;
+        void stream
+          .writeSSE({ data: JSON.stringify(buildPayload(s)) })
+          .catch(() => {
+            unsubscribe();
+          })
+          .finally(() => {
+            writing = false;
+          });
+      };
+      const unsubscribe = opts.poller.onSnapshot(send);
+      stream.onAbort(unsubscribe);
+      send(opts.poller.getSnapshot());
+      while (!stream.aborted) await stream.sleep(30000);
+    });
+  });
+
+  app.delete("/api/sessions/:env/:paneId", async (c) => {
+    const env = opts.envs.find((e) => e.id === c.req.param("env"));
+    if (!env) return c.json({ error: { code: "validation", message: "unknown env" } }, 400);
+    const paneId = c.req.param("paneId");
+    if (!PANE_RE.test(paneId)) return c.json({ error: { code: "validation", message: "bad paneId" } }, 400);
+    try {
+      await closePane(env, paneId);
+      return c.json({ ok: true });
+    } catch (err) {
+      return c.json({ error: { code: "herdr", message: err instanceof Error ? err.message : String(err) } }, 500);
+    }
+  });
+
+  app.get("/api/sessions/:env/:paneId/read", async (c) => {
+    const env = opts.envs.find((e) => e.id === c.req.param("env"));
+    if (!env) return c.json({ error: { code: "validation", message: "unknown env" } }, 400);
+    const paneId = c.req.param("paneId");
+    if (!PANE_RE.test(paneId)) return c.json({ error: { code: "validation", message: "bad paneId" } }, 400);
+    // Guard `?lines=`: an absent key → 50; a present-but-bad value (`""`→0, `"abc"`→NaN) → 50;
+    // otherwise clamp to [1, 500] so a caller can't drive `herdr pane read --lines 0|NaN|100000`.
+    const rawLines = c.req.query("lines");
+    const lines = rawLines !== undefined ? Math.max(1, Math.min(500, Number(rawLines) || 50)) : 50;
+    // Key by the pane's CURRENT sessionId too: paneId is reuse-prone (herdr restart churn), so without
+    // it a restart that reassigns this paneId to a different session could serve the prior session's
+    // cached text within the TTL. A changed sessionId → different key → cache miss → fresh read.
+    const liveSid = opts.poller.getSnapshot().sessions.find((s) => s.env === env.id && s.paneId === paneId)?.sessionId ?? "";
+    const cacheKey = `${env.id}:${paneId}:${String(lines)}:${liveSid}`;
+    const cached = readCache.get(cacheKey);
+    if (cached !== undefined) return c.json(cached);
+    try {
+      const result = await read(env, paneId, lines);
+      readCache.set(cacheKey, result); // cache successes only — a 502 must not stick
+      return c.json(result);
+    } catch (err) {
+      // Unreachable env / herdr timeout is an expected, frequently-polled condition (the Unassigned
+      // mini-terminal reads every 5s per card) — return the structured shape its siblings use rather
+      // than a bare 500 + stack. The client's read loop keeps the last good snapshot on this.
+      return c.json({ error: { code: "read_failed", message: err instanceof Error ? err.message : String(err) } }, 502);
+    }
+  });
+
+  // Last-activity timestamp derived from the session's Claude transcript, TTL-cached per env+session
+  // to keep detached-row polling cheap. Called only for detached session rows, never per SSE frame.
+  app.get("/api/sessions/:env/:sessionId/last-active", async (c) => {
+    const env = opts.envs.find((e) => e.id === c.req.param("env"));
+    if (!env) return c.json({ error: { code: "validation", message: "unknown env" } }, 400);
+    const sessionId = c.req.param("sessionId");
+    if (!UUID_RE.test(sessionId)) return c.json({ error: { code: "validation", message: "bad sessionId" } }, 400);
+    const key = `${env.id}:${sessionId}`;
+    const cached = laCache.get(key);
+    if (cached !== undefined) return c.json({ lastActive: cached }); // undefined = miss; null = cached "no transcript"
+    let value: number | null;
+    try {
+      value = await lastActivity(env, sessionId);
+    } catch {
+      value = null;
+    }
+    laCache.set(key, value);
+    return c.json({ lastActive: value });
+  });
+
+  // Targets for the spawn "Into" picker: existing herdr spaces to JOIN (live; empty on an unreachable
+  // env) plus the env's configured repos to create a NEW space from (from trusted config — always
+  // available even when the env is unreachable). The client groups them and dedupes a repo that already
+  // has a same-named space. Env is validated against the trusted list.
+  app.get("/api/envs/:env/spawn-targets", async (c) => {
+    const env = opts.envs.find((e) => e.id === c.req.param("env"));
+    if (!env) return c.json({ error: { code: "validation", message: "unknown env" } }, 400);
+    // Only repo NAMES cross to the browser — the configured absolute paths stay server-side (used at
+    // spawn to root a new space; the client just needs the name to pick and to send back as `repo`).
+    const repos = Object.keys(env.repos).map((name) => ({ name }));
+    let spaces: { workspaceId: string; label: string }[] = [];
+    try {
+      spaces = (await listWs(env)).map((w) => ({ workspaceId: w.workspace_id, label: w.label }));
+    } catch { /* unreachable env → no join targets; repo options still offered */ }
+    return c.json({ spaces, repos });
+  });
+
+  // Drop-to-attach upload. Bytes land in a temp file on the env's own machine — written directly for a
+  // local env, streamed over the shared ssh connection for a remote one; the web then injects the
+  // returned absolute path into the pane. Origin-allowlisted (multipart is a CORS-simple
+  // content type, so the Host-only anti-rebinding middleware above is insufficient) + a pre-buffer
+  // body-limit (a post-parse size check cannot prevent the OOM). No auth beyond the loopback bind + Origin gate, matching the JSON API.
+  app.post(
+    "/api/envs/:env/uploads",
+    bodyLimit({
+      maxSize: UPLOAD_MAX_BYTES,
+      onError: (c) => c.json({ error: { code: "too_large", message: "file exceeds the 25 MB limit" } }, 413),
+    }),
+    async (c) => {
+      const origin = c.req.header("origin");
+      if (origin === undefined || !allowedOrigins.includes(origin)) {
+        return c.json({ error: { code: "forbidden", message: "origin not allowed" } }, 403);
+      }
+      const env = opts.envs.find((e) => e.id === c.req.param("env"));
+      if (!env) return c.json({ error: { code: "validation", message: "unknown env" } }, 400);
+      let body: Record<string, string | File>;
+      try {
+        body = await c.req.parseBody();
+      } catch {
+        return c.json({ error: { code: "validation", message: "invalid form body" } }, 400);
+      }
+      const file = body.file;
+      if (!(file instanceof File)) {
+        return c.json({ error: { code: "validation", message: "missing 'file' field" } }, 400);
+      }
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      let dest: string;
+      if (env.kind === "remote") {
+        try {
+          dest = await writeRemote(env, { name: sanitizeUploadName(file.name), bytes });
+        } catch (err) {
+          return c.json({ error: { code: "upload_failed", message: err instanceof Error ? err.message : String(err) } }, 502);
+        }
+      } else {
+        dest = await writeUploadFile({ root: uploadRoot, originalName: file.name, bytes });
+      }
+      // Audit (SEC-6 posture): record the write, never the contents.
+      console.warn(`[upload] env=${env.id} bytes=${String(bytes.byteLength)} path=${dest}`);
+      return c.json({ path: dest });
+    },
+  );
+
+  // ---------- boards CRUD ----------
+
+  app.get("/api/boards", (c) => {
+    if (opts.storage === undefined) return c.json({ error: { code: "no_storage" } }, 503);
+    // Log-free, exactly as the stream frame is: the web re-fetches this list on mount and after every
+    // task mutation, and the MCP parses it for the fleet digest and the bind picker — none of them
+    // read an entry. `GET /api/boards/:bid` below is the read that carries the log.
+    return c.json(opts.storage.getAllBoards().map(toBoardFrame));
+  });
+
+  app.post("/api/boards", async (c) => {
+    if (opts.storage === undefined) return c.json({ error: { code: "no_storage" } }, 503);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return c.json({ error: { code: "validation", message: "invalid JSON" } }, 400); }
+    const parsed = CreateBoardBodySchema.safeParse(body);
+    if (!parsed.success) return c.json({ error: { code: "validation", message: parsed.error.message } }, 400);
+    const { label } = parsed.data;
+    const id = slugifyBoardId(label);
+    const existingIds = opts.storage.listBoardIds();
+    if (existingIds.includes(id)) {
+      return c.json({ error: { code: "board_id_collision", generatedId: id } }, 409);
+    }
+    const board = await opts.storage.withBoard(id, () => {
+      const b = { id, label, columns: [...DEFAULT_COLUMNS], tasks: [], description: "", spawnPresets: [], defaultSpawnPresetId: null };
+      return { board: b, result: b };
+    });
+    return c.json(board, 201);
+  });
+
+  app.get("/api/boards/:bid", (c) => {
+    if (opts.storage === undefined) return c.json({ error: { code: "no_storage" } }, 503);
+    const bid = c.req.param("bid");
+    if (!BID_RE.test(bid)) return c.json({ error: { code: "validation", message: "bad boardId" } }, 400);
+    const board = opts.storage.getBoard(bid);
+    if (board === null) return c.json({ error: { code: "not_found" } }, 404);
+    return c.json(board);
+  });
+
+  app.patch("/api/boards/:bid", async (c) => {
+    if (opts.storage === undefined) return c.json({ error: { code: "no_storage" } }, 503);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return c.json({ error: { code: "validation", message: "invalid JSON" } }, 400); }
+    const parsed = PatchBoardBodySchema.safeParse(body);
+    if (!parsed.success) return c.json({ error: { code: "validation", message: parsed.error.message } }, 400);
+    const bid = c.req.param("bid");
+    if (!BID_RE.test(bid)) return c.json({ error: { code: "validation", message: "bad boardId" } }, 400);
+    const { label, columns, description, spawnPresets, defaultSpawnPresetId } = parsed.data;
+    if (columns?.length === 0) {
+      return c.json({ error: { code: "validation", message: "columns must not be empty" } }, 400);
+    }
+    if (spawnPresets !== undefined && new Set(spawnPresets.map((p) => p.id)).size !== spawnPresets.length) {
+      return c.json({ error: { code: "validation", message: "duplicate preset id" } }, 400);
+    }
+    const result = await opts.storage.withBoard(bid, (existing) => {
+      if (existing === null) return { board: null, result: null };
+      let updated = { ...existing };
+      if (label !== undefined) updated = { ...updated, label };
+      if (columns !== undefined) {
+        const removedIds = new Set(existing.columns.map((col) => col.id).filter((id) => !columns.some((c2) => c2.id === id)));
+        // The landing column, never index 0 — a closed column at 0 would bulk-rewrite these tasks
+        // into a collapsed strip with no undo. See defaultColumnId (shared/board-schema.ts).
+        const landingColId = defaultColumnId(columns);
+        if (removedIds.size > 0 && landingColId !== undefined) {
+          updated = {
+            ...updated,
+            tasks: existing.tasks.map((task) =>
+              removedIds.has(task.status) ? { ...task, status: landingColId } : task,
+            ),
+          };
+        }
+        updated = { ...updated, columns };
+      }
+      if (description !== undefined) updated = { ...updated, description };
+      if (spawnPresets !== undefined) updated = { ...updated, spawnPresets: [...spawnPresets] };
+      if (defaultSpawnPresetId !== undefined) updated = { ...updated, defaultSpawnPresetId };
+      // A default pointing at no preset is no default — resolve it here rather than leaving a dangling
+      // id for every reader to re-handle. Re-checked after BOTH assignments, so replacing the list in
+      // the same patch that keeps the old default cannot leave a dangle behind.
+      if (updated.defaultSpawnPresetId !== null
+        && !updated.spawnPresets.some((p) => p.id === updated.defaultSpawnPresetId)) {
+        updated = { ...updated, defaultSpawnPresetId: null };
+      }
+      return { board: updated, result: updated };
+    });
+    if (result === null) return c.json({ error: { code: "not_found" } }, 404);
+    return c.json(result);
+  });
+
+  // Deletion is refused while the board still holds tasks — read-and-decide inside the SAME withBoard
+  // callback (not a read-then-delete pair) so a concurrent task create/attach between the check and the
+  // write can't race past the guard.
+  app.delete("/api/boards/:bid", async (c) => {
+    if (opts.storage === undefined) return c.json({ error: { code: "no_storage" } }, 503);
+    const bid = c.req.param("bid");
+    if (!BID_RE.test(bid)) return c.json({ error: { code: "validation", message: "bad boardId" } }, 400);
+    type DeleteResult = "not_found" | "ok" | { readonly taskCount: number };
+    const result = await opts.storage.withBoard<DeleteResult>(bid, (existing) => {
+      if (existing === null) return { board: null, result: "not_found" };
+      if (existing.tasks.length > 0) return { board: existing, result: { taskCount: existing.tasks.length } };
+      return { board: null, result: "ok" };
+    });
+    if (result === "not_found") return c.json({ error: { code: "not_found" } }, 404);
+    if (result !== "ok") {
+      const { taskCount } = result;
+      return c.json({
+        error: {
+          code: "board_not_empty",
+          message: `Board has ${String(taskCount)} task${taskCount === 1 ? "" : "s"} — delete or move them first.`,
+        },
+      }, 409);
+    }
+    return c.json({ ok: true });
+  });
+
+  // ---------- tasks CRUD ----------
+
+  app.post("/api/boards/:bid/tasks", async (c) => {
+    if (opts.storage === undefined) return c.json({ error: { code: "no_storage" } }, 503);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return c.json({ error: { code: "validation", message: "invalid JSON" } }, 400); }
+    const parsed = CreateTaskBodySchema.safeParse(body);
+    if (!parsed.success) return c.json({ error: { code: "validation", message: parsed.error.message } }, 400);
+    const bid = c.req.param("bid");
+    if (!BID_RE.test(bid)) return c.json({ error: { code: "validation", message: "bad boardId" } }, 400);
+    const now = nowSecs();
+    // Provenance for the first log entry: who created the card (resolved from the fleet, never trusted
+    // from the body) and which card it follows up. `env`/`paneId` absent → the web "add task": no
+    // session, so the entry is stamped by corral with no creator named.
+    const { env: creatorEnv, paneId: creatorPane, sourceBoardId, sourceTaskId } = parsed.data;
+    let createdText = "card created";
+    if (creatorEnv !== undefined && creatorPane !== undefined) {
+      const snapshot = opts.poller.getSnapshot().sessions;
+      const writer = resolveWriter(opts.storage.getAllBoards().flatMap((b) => b.tasks), { env: creatorEnv, paneId: creatorPane }, snapshot);
+      const who = writer !== null && typeof writer !== "string"
+        ? sessionRef({ name: writer.name, env: creatorEnv, paneId: creatorPane })
+        : `${creatorEnv}:${creatorPane}`;
+      createdText = sourceBoardId !== undefined && sourceTaskId !== undefined
+        ? `created by ${who}, follow-up of ${sourceBoardId}/${sourceTaskId}`
+        : `created by ${who}`;
+    }
+    type CreateResult = "board_not_found" | "no_columns" | { ok: true; task: Task };
+    const result = await opts.storage.withBoard<CreateResult>(bid, (existing) => {
+      if (existing === null) return { board: null, result: "board_not_found" };
+      const status = parsed.data.status ?? defaultColumnId(existing.columns);
+      if (status === undefined) return { board: existing, result: "no_columns" };
+      const base = {
+        id: generateTaskId(),
+        title: parsed.data.title,
+        description: parsed.data.description ?? "",
+        status,
+        priority: parsed.data.priority ?? null,
+        sessions: [],
+        log: [],
+        createdAt: now,
+        updatedAt: now,
+      };
+      const newTask = stampSystem(base, "created", createdText);
+      return { board: { ...existing, tasks: [...existing.tasks, newTask] }, result: { ok: true, task: newTask } };
+    });
+    if (result === "board_not_found") return c.json({ error: { code: "not_found" } }, 404);
+    if (result === "no_columns") return c.json({ error: { code: "validation", message: "board has no columns" } }, 400);
+    // Log-free like every other task-shaped response — the `created` entry just stamped stays behind:
+    // `GET /api/boards/:bid` is the one route that carries a log.
+    const { log: _log, ...frame } = result.task;
+    return c.json(frame, 201);
+  });
+
+  async function patchTask(c: Context, bid: string, tid: string, cas: boolean): Promise<Response> {
+    if (opts.storage === undefined) return c.json({ error: { code: "no_storage" } }, 503);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return c.json({ error: { code: "validation", message: "invalid JSON" } }, 400); }
+    const parsed = cas ? EditTaskBodySchema.safeParse(body) : PatchTaskBodySchema.safeParse(body);
+    if (!parsed.success) return c.json({ error: { code: "validation", message: parsed.error.message } }, 400);
+    const baseRev = "baseRev" in parsed.data ? parsed.data.baseRev : undefined;
+    if (!BID_RE.test(bid)) return c.json({ error: { code: "validation", message: "bad boardId" } }, 400);
+    if (!TID_RE.test(tid)) return c.json({ error: { code: "validation", message: "bad taskId" } }, 400);
+    type PatchResult = null | { found: false } | { found: true; conflict: true } | { found: true; conflict: false; task: Task };
+    const result = await opts.storage.withBoard<PatchResult>(bid, (existing) => {
+      if (existing === null) return { board: null, result: null };
+      const idx = existing.tasks.findIndex((t) => t.id === tid);
+      if (idx === -1) return { board: existing, result: { found: false } };
+      const old = existing.tasks[idx];
+      if (old === undefined) return { board: existing, result: { found: false } };
+      if (baseRev !== undefined && descriptionRev(bid, tid, old.description) !== baseRev) {
+        return { board: existing, result: { found: true, conflict: true } };
+      }
+      const updated = {
+        ...old,
+        ...(parsed.data.title !== undefined ? { title: parsed.data.title } : {}),
+        ...(parsed.data.status !== undefined ? { status: parsed.data.status } : {}),
+        ...(parsed.data.priority !== undefined ? { priority: parsed.data.priority } : {}),
+        ...(parsed.data.description !== undefined ? { description: parsed.data.description } : {}),
+        updatedAt: nowSecs(),
+      };
+      // Stamp status_changed only on an ACTUAL move — columns and nothing more (§10): the fact that
+      // "this ended the task" already lives on the board via the closing-column marker, and a copy
+      // here would diverge the first time a column is renamed.
+      const stamped = parsed.data.status !== undefined && parsed.data.status !== old.status
+        ? stampSystem(updated, "status_changed", `${old.status} → ${parsed.data.status}`)
+        : updated;
+      const tasks = [...existing.tasks];
+      tasks[idx] = stamped;
+      return { board: { ...existing, tasks }, result: { found: true, conflict: false, task: stamped } };
+    });
+    if (!result?.found) return c.json({ error: { code: "not_found" } }, 404);
+    if (result.conflict) {
+      return c.json({ error: { code: "description_conflict", message: "the card or its description changed since baseRev was read" } }, 409);
+    }
+    // The THIRD client-facing path, and log-free like the other two. A PATCH cannot change the log —
+    // appending has its own route — so echoing it back is a copy nobody asked for on a response the
+    // web holds as its updated task. One-off rather than per-tick, so the cost is not the argument:
+    // the argument is that a card's log is fetched from exactly one place, `GET /api/boards/:bid`.
+    const { log: _log, ...frame } = result.task;
+    return cas ? c.json({ ...frame, descriptionRev: descriptionRev(bid, tid, frame.description) }) : c.json(frame);
+  }
+
+  app.patch("/api/boards/:bid/tasks/:tid", (c) => patchTask(c, c.req.param("bid"), c.req.param("tid"), false));
+  app.patch("/api/boards/:bid/tasks/:tid/edit", (c) => patchTask(c, c.req.param("bid"), c.req.param("tid"), true));
+
+  // Appending is its own route rather than a field on the task PATCH — see AppendLogBodySchema.
+  // Storage already gives everything the append needs: `withBoard` serializes read-modify-write under
+  // an async mutex and `writeAtomic` commits, so this is a new route and no new locking.
+  app.post("/api/boards/:bid/tasks/:tid/log", async (c) => {
+    if (opts.storage === undefined) return c.json({ error: { code: "no_storage" } }, 503);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return c.json({ error: { code: "validation", message: "invalid JSON" } }, 400); }
+    const parsed = AppendLogBodySchema.safeParse(body);
+    if (!parsed.success) return c.json({ error: { code: "validation", message: parsed.error.message } }, 400);
+    const bid = c.req.param("bid");
+    if (!BID_RE.test(bid)) return c.json({ error: { code: "validation", message: "bad boardId" } }, 400);
+    const tid = c.req.param("tid");
+    if (!TID_RE.test(tid)) return c.json({ error: { code: "validation", message: "bad taskId" } }, 400);
+    const { kind, text, env, paneId } = parsed.data;
+    // Refused, not truncated: a note is a thought, and a cut one loses its conclusion. The overage
+    // is named so the writer can shorten by that much and log again.
+    if (text.length > LOG_ENTRY_TEXT_MAX) {
+      return c.json({ error: { code: "too_long", message: logTooLong(text.length) } }, 400);
+    }
+    if (!opts.envs.find((e) => e.id === env)) {
+      return c.json({ error: { code: "validation", message: "unknown env" } }, 400);
+    }
+    // The same guard the neighbouring body routes apply (attach, detach). Nothing here does more than
+    // a snapshot lookup with it, but an exception to that discipline is an exception someone has to
+    // explain later.
+    if (!PANE_RE.test(paneId)) {
+      return c.json({ error: { code: "validation", message: "bad paneId" } }, 400);
+    }
+    const sessions = opts.poller.getSnapshot().sessions;
+    // Every board's links, so a session bound to ANOTHER card resolves as a valid writer — §4 permits
+    // appending to a card you are not bound to. Read outside the target lock; the callback prepends
+    // the target card's own (freshly locked) links so an attach that raced this read still wins.
+    const allBoards = opts.storage.getAllBoards();
+
+    type AppendResult = "not_found" | "not_bound" | { readonly logCount: number; readonly atMs: number };
+    const result = await opts.storage.withBoard<AppendResult>(bid, (existing) => {
+      if (existing === null) return { board: null, result: "not_found" };
+      const idx = existing.tasks.findIndex((t) => t.id === tid);
+      const old = idx === -1 ? undefined : existing.tasks[idx];
+      if (old === undefined) return { board: existing, result: "not_found" };
+      // Resolved from the fleet INSIDE the lock: the writer may be bound to any card, but a card
+      // deleted between the read and the write is a 404 rather than a silent write.
+      const source = resolveLogSource(old, allBoards, { env, paneId }, sessions);
+      if (source === null) return { board: existing, result: "not_bound" };
+      // Stamped INSIDE the lock, beside the append it belongs to. Read before it, two requests that
+      // queue on the mutex can be stored in an order their own timestamps contradict — and
+      // `lastLogAtMs`, which reads the last entry, would then report less than the newest entry.
+      const atMs = Date.now();
+      const log = appendLogEntry(old.log, { id: generateLogEntryId(), atMs, source, kind, text });
+      const tasks = [...existing.tasks];
+      // `updatedAt` deliberately untouched: it means "the task statement changed", and the board sorts
+      // on createdAt anyway. A note is not an edit of the task.
+      tasks[idx] = { ...old, log };
+      return { board: { ...existing, tasks }, result: { logCount: log.length, atMs } };
+    });
+    if (result === "not_found") return c.json({ error: { code: "not_found" } }, 404);
+    if (result === "not_bound") {
+      // The writer resolved to NO card anywhere: a log entry's `source` is a session on some card, so
+      // a pane bound nowhere has no identity to stamp. Appending to ANOTHER card is fine — §4 permits
+      // it — which is why this no longer says "not bound to THIS card".
+      return c.json({
+        error: { code: "not_bound", message: "this session is not bound to any card — call corral_task_bind first" },
+      }, 403);
+    }
+    return c.json({ ok: true, atMs: result.atMs, logCount: result.logCount }, 201);
+  });
+
+  app.delete("/api/boards/:bid/tasks/:tid", async (c) => {
+    if (opts.storage === undefined) return c.json({ error: { code: "no_storage" } }, 503);
+    const bid = c.req.param("bid");
+    if (!BID_RE.test(bid)) return c.json({ error: { code: "validation", message: "bad boardId" } }, 400);
+    const tid = c.req.param("tid");
+    if (!TID_RE.test(tid)) return c.json({ error: { code: "validation", message: "bad taskId" } }, 400);
+    const found = await opts.storage.withBoard(bid, (existing) => {
+      if (existing === null) return { board: null, result: false };
+      const idx = existing.tasks.findIndex((t) => t.id === tid);
+      if (idx === -1) return { board: existing, result: false };
+      const tasks = [...existing.tasks];
+      tasks.splice(idx, 1);
+      return { board: { ...existing, tasks }, result: true };
+    });
+    if (!found) return c.json({ error: { code: "not_found" } }, 404);
+    return c.json({ ok: true });
+  });
+
+  // ---------- attach / detach / from-session ----------
+
+  app.post("/api/boards/:bid/tasks/:tid/attach", async (c) => {
+    if (opts.storage === undefined) return c.json({ error: { code: "no_storage" } }, 503);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return c.json({ error: { code: "validation", message: "invalid JSON" } }, 400); }
+    const parsed = AttachBodySchema.safeParse(body);
+    if (!parsed.success) return c.json({ error: { code: "validation", message: parsed.error.message } }, 400);
+    const bid = c.req.param("bid");
+    if (!BID_RE.test(bid)) return c.json({ error: { code: "validation", message: "bad boardId" } }, 400);
+    const tid = c.req.param("tid");
+    if (!TID_RE.test(tid)) return c.json({ error: { code: "validation", message: "bad taskId" } }, 400);
+    const { env, paneId } = parsed.data;
+    if (!opts.envs.find((e) => e.id === env)) {
+      return c.json({ error: { code: "validation", message: "unknown env" } }, 400);
+    }
+    if (!PANE_RE.test(paneId)) {
+      return c.json({ error: { code: "validation", message: "bad paneId" } }, 400);
+    }
+    const key = `${env}:${paneId}`;
+
+    // Enrich from the live poller snapshot: the drag/drop client only sends env+paneId, so without
+    // this the stored link has empty tab/workspace labels and the card renders " / ". The snapshot
+    // is the source of truth for the current labels; fall back to any body-supplied values.
+    const liveRow = opts.poller.getSnapshot().sessions.find((s) => `${s.env}:${s.paneId}` === key);
+
+    const result = await opts.storage.withBoard(bid, (existing) => {
+      if (existing === null) return { board: null, result: "board_not_found" as const };
+      const taskIdx = existing.tasks.findIndex((t) => t.id === tid);
+      if (taskIdx === -1) return { board: existing, result: "task_not_found" as const };
+      const task = existing.tasks[taskIdx];
+      if (task === undefined) return { board: existing, result: "task_not_found" as const };
+      // Idempotent only for the SAME live session (by UUID, else paneId for legacy null-UUID links).
+      // A stale dead-UUID pane-mate no longer suppresses the append, so a restarted session attaches
+      // alongside the old (now-detached) card.
+      if (isSessionBound(task.sessions, { env, paneId, liveSessionId: liveRow?.sessionId ?? null })) {
+        return { board: existing, result: "ok" as const };
+      }
+      // Check if already assigned in any board (must check all boards, but we only hold this board's mutex)
+      // Per spec: claim-checked only for from-session; attach is idempotent within the task
+      const link: SessionLink = {
+        env: parsed.data.env,
+        paneId: parsed.data.paneId,
+        // Persist the stable herdr ids from the live row (the client sends only {env,paneId}); without
+        // them a later close/resume has no tab/workspace to address. Body values are a legacy fallback.
+        tabId: liveRow?.tabId ?? parsed.data.tabId,
+        tabLabel: liveRow !== undefined ? liveRow.tab : parsed.data.tabLabel,
+        workspaceId: liveRow?.workspaceId ?? parsed.data.workspaceId,
+        workspaceLabel: liveRow !== undefined ? liveRow.workspace : parsed.data.workspaceLabel,
+        name: parsed.data.name !== ""
+          ? parsed.data.name
+          : (liveRow !== undefined ? (liveRow.tab !== "?" && liveRow.tab !== "" ? liveRow.tab : liveRow.paneId) : parsed.data.paneId),
+        cwdSnapshot: liveRow !== undefined ? liveRow.cwd : parsed.data.cwdSnapshot,
+        // Persist the stable Claude UUID from the live row (null if the pane isn't a registered agent
+        // yet — the reconciler backfills it). This is what lets the binding survive paneId churn.
+        sessionId: liveRow?.sessionId ?? null,
+      };
+      const tasks = [...existing.tasks];
+      const bound = { ...task, sessions: [...task.sessions, link], updatedAt: nowSecs() };
+      tasks[taskIdx] = stampSystem(bound, "session_bound", `bound ${sessionRef(link)}`);
+      return { board: { ...existing, tasks }, result: "ok" as const };
+    });
+
+    if (result === "board_not_found" || result === "task_not_found") {
+      return c.json({ error: { code: "not_found" } }, 404);
+    }
+    return c.json({ ok: true });
+  });
+
+  app.post("/api/boards/:bid/tasks/:tid/detach", async (c) => {
+    if (opts.storage === undefined) return c.json({ error: { code: "no_storage" } }, 503);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return c.json({ error: { code: "validation", message: "invalid JSON" } }, 400); }
+    const parsed = DetachBodySchema.safeParse(body);
+    if (!parsed.success) return c.json({ error: { code: "validation", message: parsed.error.message } }, 400);
+    const bid = c.req.param("bid");
+    if (!BID_RE.test(bid)) return c.json({ error: { code: "validation", message: "bad boardId" } }, 400);
+    const tid = c.req.param("tid");
+    if (!TID_RE.test(tid)) return c.json({ error: { code: "validation", message: "bad taskId" } }, 400);
+    if (!opts.envs.find((e) => e.id === parsed.data.env)) {
+      return c.json({ error: { code: "validation", message: "unknown env" } }, 400);
+    }
+    if (!PANE_RE.test(parsed.data.paneId)) {
+      return c.json({ error: { code: "validation", message: "bad paneId" } }, 400);
+    }
+    const key = `${parsed.data.env}:${parsed.data.paneId}`;
+    // Churn-heal (mirrors close): the UI may send a healed paneId for a stale-paneId link, so resolve
+    // the unlink target by the live row's sessionId when the incoming paneId matches no stored link.
+    const liveRow = opts.poller.getSnapshot().sessions.find((s) => `${s.env}:${s.paneId}` === key);
+
+    const result = await opts.storage.withBoard(bid, (existing) => {
+      if (existing === null) return { board: null, result: "board_not_found" as const };
+      const taskIdx = existing.tasks.findIndex((t) => t.id === tid);
+      if (taskIdx === -1) return { board: existing, result: "task_not_found" as const };
+      const task = existing.tasks[taskIdx];
+      if (task === undefined) return { board: existing, result: "task_not_found" as const };
+      const idx = resolveLinkIndex(task.sessions, {
+        env: parsed.data.env, paneId: parsed.data.paneId,
+        sessionId: parsed.data.sessionId, liveSessionId: liveRow?.sessionId ?? null,
+      });
+      // Idempotent no-op when nothing resolved — and then no entry: a detach that unlinked nothing is
+      // not a lifecycle event, only a request that found its target already gone.
+      const removed = idx === -1 ? undefined : task.sessions[idx];
+      const sessions = idx === -1 ? task.sessions : task.sessions.filter((_, i) => i !== idx);
+      const unlinked = { ...task, sessions, updatedAt: nowSecs() };
+      const tasks = [...existing.tasks];
+      tasks[taskIdx] = removed === undefined ? unlinked : stampSystem(unlinked, "session_detached", `detached ${sessionRef(removed)}`);
+      return { board: { ...existing, tasks }, result: "ok" as const };
+    });
+
+    if (result === "board_not_found" || result === "task_not_found") {
+      return c.json({ error: { code: "not_found" } }, 404);
+    }
+    return c.json({ ok: true });
+  });
+
+  // Task-scoped "close" kills a running Claude session with `herdr pane close <paneId>`, which cascades
+  // pane → tab → workspace (herdr refuses `tab close` on a workspace's last tab, so pane close is the
+  // one primitive that always works and cleans up the empty workspace when it was ours). It keeps the
+  // task→session LINK — distinct from /detach above, which only unlinks — and mutates the board only
+  // to append a session_closed log entry (below); the session disappears from the next poll and the
+  // card renders detached, link intact and resumable. A live row for the
+  // pane is REQUIRED, and its sessionId must match the link's, so a detached or churn-reused pane is
+  // never closed out from under a stranger.
+  app.post("/api/boards/:bid/tasks/:tid/sessions/:env/:paneId/close", async (c) => {
+    if (opts.storage === undefined) return c.json({ error: { code: "no_storage" } }, 503);
+    const storage = opts.storage; // captured so the stampClosed closure keeps the narrowed type
+    const bid = c.req.param("bid");
+    if (!BID_RE.test(bid)) return c.json({ error: { code: "validation", message: "bad boardId" } }, 400);
+    const tid = c.req.param("tid");
+    if (!TID_RE.test(tid)) return c.json({ error: { code: "validation", message: "bad taskId" } }, 400);
+    const env = opts.envs.find((e) => e.id === c.req.param("env"));
+    if (!env) return c.json({ error: { code: "validation", message: "unknown env" } }, 400);
+    const paneId = c.req.param("paneId");
+    if (!PANE_RE.test(paneId)) return c.json({ error: { code: "validation", message: "bad paneId" } }, 400);
+    const board = opts.storage.getBoard(bid);
+    if (board === null) return c.json({ error: { code: "not_found" } }, 404);
+    const task = board.tasks.find((t) => t.id === tid);
+    if (task === undefined) return c.json({ error: { code: "not_found" } }, 404);
+    // ?sid picks one of possibly-several same-pane links; absent → paneId resolution + churn-heal.
+    const sid = c.req.query("sid") ?? null;
+    if (sid !== null && !UUID_RE.test(sid)) return c.json({ error: { code: "validation", message: "bad sid" } }, 400);
+    const key = `${env.id}:${paneId}`;
+    const liveRow = opts.poller.getSnapshot().sessions.find((s) => `${s.env}:${s.paneId}` === key);
+    const idx = resolveLinkIndex(task.sessions, { env: env.id, paneId, sessionId: sid, liveSessionId: liveRow?.sessionId ?? null });
+    const link = idx === -1 ? undefined : task.sessions[idx];
+    if (link === undefined) return c.json({ error: { code: "not_found", message: "session not linked" } }, 404);
+    if (liveRow === undefined) return c.json({ error: { code: "no_live_pane", message: "pane is not live — nothing to close" } }, 404);
+    // Poisoning guard: only close the pane when we can PROVE the live row is ours — by sessionId, or
+    // (for a null-sessionId link: no integration, or the pre-backfill /new window) by matching the
+    // link's stored tab identity. A herdr restart can reuse a paneId for a stranger; without this we'd
+    // kill it. Mirrors the zombie reaper's tab-identity guard.
+    const linkSid = link.sessionId;
+    const ownsBySession = linkSid !== null && linkSid !== "" && liveRow.sessionId === linkSid;
+    const ownsByTab = (linkSid === null || linkSid === "") && liveRow.tabId === link.tabId && liveRow.workspaceId === link.workspaceId;
+    if (!ownsBySession && !ownsByTab) {
+      return c.json({ error: { code: "pane_reused", message: "pane now belongs to a different session" } }, 409);
+    }
+    // The one board write close makes (§13a lists it as a stamping route): the LINK is untouched — the
+    // card still renders detached and stays resumable — but a session_closed entry records the suspend.
+    const stampClosed = (): Promise<void> => storage.withBoard(bid, (existing) => {
+      if (existing === null) return { board: null, result: undefined };
+      const tIdx = existing.tasks.findIndex((t) => t.id === tid);
+      const t = tIdx === -1 ? undefined : existing.tasks[tIdx];
+      if (t === undefined) return { board: existing, result: undefined };
+      const tasks = [...existing.tasks];
+      tasks[tIdx] = stampSystem(t, "session_closed", `closed ${sessionRef(link)}`);
+      return { board: { ...existing, tasks }, result: undefined };
+    });
+    // §5.4 (MCP design): a SELF-close must deliver its response before the pane dies — killing the
+    // caller's own pane also kills the MCP process making this request. With ?deferred=1 the route
+    // runs EVERY guard above, responds, and only then closes the pane on a short unref'd timer.
+    // Post-response failures are logged only; the zombie reaper collects any straggler tab.
+    if (c.req.query("deferred") === "1") {
+      // Stamped BEFORE the response here, because the deferred kill happens after it and the caller
+      // may be closing itself — there is no later moment this route still runs to record the suspend.
+      await stampClosed();
+      setTimeout(() => {
+        closePaneFn(env, paneId).catch((err: unknown) => {
+          console.warn(`[close] deferred close of ${env.id}:${paneId} failed: ${err instanceof Error ? err.message : String(err)}`);
+        });
+      }, closeDeferMs).unref();
+      return c.json({ ok: true, scheduled: true });
+    }
+    try {
+      await closePaneFn(env, paneId);
+    } catch (err) {
+      // Stamp only on the sync path's SUCCESS: a failed close returns 502 and must not leave the
+      // append-only log claiming a session was suspended that is still live.
+      return c.json({ error: { code: "close_failed", message: err instanceof Error ? err.message : String(err) } }, 502);
+    }
+    await stampClosed();
+    return c.json({ ok: true });
+  });
+
+  // Resume restarts a stopped Claude session: `claude --resume <uuid>` continues the SAME session id,
+  // so the rebound link KEEPS `link.sessionId` — only pane/tab/workspace coordinates change.
+  app.post("/api/boards/:bid/tasks/:tid/sessions/:env/:paneId/resume", async (c) => {
+    if (opts.storage === undefined || opts.spawn === undefined) return c.json({ error: { code: "not_configured" } }, 503);
+    const bid = c.req.param("bid");
+    if (!BID_RE.test(bid)) return c.json({ error: { code: "validation", message: "bad boardId" } }, 400);
+    const tid = c.req.param("tid");
+    if (!TID_RE.test(tid)) return c.json({ error: { code: "validation", message: "bad taskId" } }, 400);
+    const env = opts.envs.find((e) => e.id === c.req.param("env"));
+    if (!env) return c.json({ error: { code: "validation", message: "unknown env" } }, 400);
+    const paneId = c.req.param("paneId");
+    if (!PANE_RE.test(paneId)) return c.json({ error: { code: "validation", message: "bad paneId" } }, 400);
+    const board = opts.storage.getBoard(bid);
+    if (board === null) return c.json({ error: { code: "not_found" } }, 404);
+    const task = board.tasks.find((t) => t.id === tid);
+    if (task === undefined) return c.json({ error: { code: "not_found" } }, 404);
+    // ?sid picks one of possibly-several same-pane links; absent → paneId resolution + churn-heal.
+    const sid = c.req.query("sid") ?? null;
+    if (sid !== null && !UUID_RE.test(sid)) return c.json({ error: { code: "validation", message: "bad sid" } }, 400);
+    const key = `${env.id}:${paneId}`;
+    const liveRow = opts.poller.getSnapshot().sessions.find((s) => `${s.env}:${s.paneId}` === key);
+    const idx = resolveLinkIndex(task.sessions, { env: env.id, paneId, sessionId: sid, liveSessionId: liveRow?.sessionId ?? null });
+    const link = idx === -1 ? undefined : task.sessions[idx];
+    if (link === undefined) return c.json({ error: { code: "not_found", message: "session not linked" } }, 404);
+    if (link.sessionId === null || link.sessionId === "") {
+      return c.json({ error: { code: "no_session_id", message: "no Claude session id to resume" } }, 400);
+    }
+    if (!UUID_RE.test(link.sessionId)) {
+      return c.json({ error: { code: "validation", message: "bad sessionId" } }, 400);
+    }
+    // `claude --resume` is cwd-scoped: launch where the session actually ran, read from its own
+    // transcript. cwdSnapshot (the herdr pane cwd captured at bind time) is only a fallback — it can
+    // diverge from the session's real dir (e.g. an adopted session whose pane shell sat at $HOME),
+    // and resuming from the wrong dir both lands Claude there AND fails to find the transcript.
+    const resumeCwd = (await sessionCwd(env, link.sessionId)) ?? link.cwdSnapshot;
+    // ONLY a herdr tab label: resume launches `claude --resume <id>` with no flags, so Claude restores
+    // its own name, and spawn.ts's tab-name rejoin is skipped on this path. Nothing to disambiguate
+    // against, hence the bare `-1` rather than composeSessionName's collision search.
+    //
+    // Deriving it here is what lets spawn.ts's `<taskSlug>-a` go: that was a second name source the
+    // route's fallback chain could not reach, so a card titled without Latin characters resumed as
+    // `task-a` however the chain improved. No repo: resume carries no request, and a card owns none,
+    // so the chain here is title then task id. It cannot return "" — `task.id` passed TID_RE above,
+    // so its last step always yields at least "t".
+    const storedName = slugify(link.name, NAME_MAX);
+    const resumeName = storedName !== ""
+      ? storedName
+      : `${fallbackNamePrefix(task.title, null, task.id)}-1`;
+    let result: SpawnResult;
+    try {
+      result = await opts.spawn({
+        // Both null now that a card carries no repository. `repoPath` was already dead here (resume
+        // takes the join branch and reads `cwd`); `repo` was the LABEL fallback for a resumed
+        // session whose workspace no longer exists (server/spawn.ts) — such a re-created space is
+        // now labelled from the task slug instead. A rename in a rare recovery path.
+        env, taskSlug: sanitizeSlug(task.title), cwd: resumeCwd, repo: null,
+        assignedPaneIds: new Set(),
+        spawnCommand: env.spawnCommand,
+        targetWorkspaceId: link.workspaceId, repoPath: null,
+        resumeSessionId: link.sessionId,
+        // Recreate the tab under the name the card already stores: without this every resumed tab is
+        // mislabelled. NOT sent as `--name` — spawn.ts omits both launch flags when resuming (the name
+        // lives in the transcript, the model with the session).
+        //
+        // SANITIZED, not trusted, and not dropped either. `link.name` is NOT a string this route
+        // composed: the attach and from-session routes take it as `z.string().default("")` straight
+        // from the client, and the MCP bind path puts the session's own Claude name there — so after
+        // a `/rename Fix the auth bug` the card holds exactly that, spaces and capitals included.
+        // `slugify` turns it into `fix-the-auth-bug`: the operator's intent survives, and a leading `-`
+        // cannot reach `herdr tab create` as a flag.
+        sessionName: resumeName,
+      });
+    } catch (err) {
+      return c.json({ error: { code: "resume_failed", message: err instanceof Error ? err.message : String(err) } }, 502);
+    }
+    const rebuilt: SessionLink = {
+      ...link,
+      paneId: result.paneId, tabId: result.tabId, workspaceId: result.workspaceId,
+      tabLabel: result.tabLabel, workspaceLabel: result.workspaceLabel, cwdSnapshot: result.cwdSnapshot,
+      // sessionId kept — `claude --resume` continues the same uuid (Task 1 probe). If the probe found
+      // it mints a new uuid, set `sessionId: null` here instead so the reconciler backfills by paneId.
+    };
+    await opts.storage.withBoard(bid, (b) => {
+      if (b === null) return { board: null, result: undefined };
+      return {
+        board: {
+          ...b,
+          // Rebind ONLY the resolved link, matched by env + its stable sessionId — NOT by `${env}:${paneId}`,
+          // which with two same-pane links would clobber the live sibling. Env-scoped like every other
+          // resolver here (resolveLinkIndex/isSessionBound): a Claude sessionId is unique per env, not
+          // globally, so a same-uuid link in another env of this task must not be overwritten. resume
+          // requires a non-null sessionId (checked above), so this targets exactly the resumed link.
+          tasks: b.tasks.map((t) => t.id === tid
+            ? { ...t, sessions: t.sessions.map((s) => s.env === link.env && s.sessionId === link.sessionId ? rebuilt : s), updatedAt: nowSecs() }
+            : t),
+        },
+        result: undefined,
+      };
+    });
+    return c.json(rebuilt);
+  });
+
+  // Bulk restore of the mirrored fleet after a herdr restart (docs spec: fleet mirror + restore).
+  // Board data is deliberately untouched: buildBoardState re-attaches card links by sessionId once a
+  // resumed session registers, and unassigned sessions reappear unassigned.
+  app.post("/api/fleet/restore", async (c) => {
+    if (opts.fleetRestore === undefined) return c.json({ error: { code: "not_configured" } }, 503);
+    const text = await c.req.text();
+    let body: unknown = {};
+    if (text !== "") {
+      try {
+        body = JSON.parse(text);
+      } catch {
+        return c.json({ error: { code: "validation", message: "invalid JSON" } }, 400);
+      }
+    }
+    const parsed = FleetRestoreRequestSchema.safeParse(body);
+    if (!parsed.success) return c.json({ error: { code: "validation", message: parsed.error.message } }, 400);
+    const run = await opts.fleetRestore.run(parsed.data);
+    if (run.status === "ok") return c.json(run.report);
+    if (run.status === "no_mirror") {
+      return c.json({ error: { code: "no_mirror", message: "no fleet mirror recorded yet — the poller writes it once a live claude session is seen" } }, 404);
+    }
+    if (run.status === "mirror_unreadable") {
+      return c.json({ error: { code: "mirror_unreadable", message: run.message } }, 500);
+    }
+    if (run.status === "unknown_env") {
+      return c.json({ error: { code: "unknown_env", message: `no configured environment "${run.env}"` } }, 400);
+    }
+    return c.json({ error: { code: "restore_in_flight", message: "a restore is already running" } }, 409);
+  });
+
+  app.post("/api/boards/:bid/tasks/:tid/spawn", async (c) => {
+    if (opts.storage === undefined || opts.spawn === undefined) {
+      return c.json({ error: { code: "not_configured" } }, 503);
+    }
+    const bid = c.req.param("bid");
+    if (!BID_RE.test(bid)) return c.json({ error: { code: "validation", message: "bad boardId" } }, 400);
+    const tid = c.req.param("tid");
+    if (!TID_RE.test(tid)) return c.json({ error: { code: "validation", message: "bad taskId" } }, 400);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return c.json({ error: { code: "validation", message: "invalid JSON" } }, 400); }
+    const parsed = z.object({
+      env: z.string(),
+      // THREE-state, and absent is NOT null. A workspace id joins it; an explicit `null` creates a
+      // new space at the repo's configured path; an ABSENT key with a `repo` resolves that repo to
+      // its own workspace (join if one exists, else create). The browser always sends the key, the
+      // MCP tool omits it — a client refactor that starts always sending it silently turns
+      // resolve-by-repo into create.
+      targetWorkspaceId: z.string().nullable().optional(),
+      // Bounded like every other field on this body: the value is echoed back in the unknown_repo
+      // 400, and a configured key is never anywhere near this long.
+      repo: z.string().max(200).nullable().optional(), // config key: roots a NEW space, or names the one to resolve
+      brief: z.string().min(1).optional(),    // initial prompt, delivered via file indirection
+      // The session's first message, delivered VERBATIM — no preamble — so a leading slash command is
+      // at position 0 of the message, which is the only position Claude Code expands it from (§2.4).
+      // Mutually exclusive with `brief`: MCP and the UI share this route, and this is what tells them
+      // apart, so an MCP caller cannot accidentally drop the preamble. The leading-character rule is
+      // the same flag hazard the `model` field guards against — this text becomes one positional argv
+      // word for `claude`, and quoting protects it from the shell, not from the argument parser. Same
+      // constant as the preset boundary, deliberately narrower than the hazard (see it for why); this
+      // route reports every bad field as a bare `invalid "<field>"`, and a preset that reaches here has
+      // already been through the readable refusal at PATCH.
+      startCommand: z.string().trim().min(1).max(2000).regex(START_COMMAND_FIRST_CHAR).optional(),
+      // The WHOLE session name, used verbatim as the herdr tab label, the card's link name and
+      // `claude --name`. No card slug is prefixed — see composeSessionName.
+      // Bound on the RAW input; `slugify` caps the result at NAME_MAX regardless. 64 used to refuse
+      // names the cap is now wide enough to carry.
+      name: z.string().max(128).optional(),
+      // Shape-validated only. corral keeps NO list of valid models: Claude Code accepts any string
+      // and fails visibly at the API, the operator corrects it, and an allowlist would need a corral
+      // release per new alias. The class is therefore wide enough for every id shape Claude Code
+      // takes — aliases (`opus`), dated ids (`claude-opus-4-5-20251101`), the `[1m]` context-window
+      // suffix, Bedrock (`us.anthropic.claude-sonnet-4-5-20250929-v1:0`, hence `:`) and Vertex
+      // (`claude-sonnet-4-5@20250929`, hence `@`), plus uppercase. A narrower class was an
+      // ACCIDENTAL allowlist that refused exactly the ids an operator has to type out in full, which
+      // is the thing this comment says corral does not do.
+      //
+      // What it still refuses is what carries risk: the first character must be alphanumeric, so no
+      // value can reach `claude` as a FLAG, and no space or shell metacharacter is admitted at all.
+      // The brackets are glob characters, which is why server/spawn.ts assembles the command through
+      // shell-quote's quote() rather than interpolating. NOTE the class writes `[\]`, not `\[\]`: an
+      // escaped `[` inside a class fails eslint's no-useless-escape, and both match the same language.
+      model: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9.:@[\]-]{0,63}$/).optional(),
+      // Start with Remote Control connected. Default OFF: this connects the session to claude.ai, so
+      // it is an explicit per-spawn decision, never implied (spec A.1). Absent === off.
+      remoteControl: z.boolean().optional(),
+      // Who is spawning this session. Absent means unknown — an old client is never recorded as
+      // "operator". A session value's sessionId may be null (the caller may not have registered
+      // yet); it is resolved from the poller snapshot below, and dropped if that fails.
+      spawnedBy: z.union([
+        z.literal("operator"),
+        z.object({ sessionId: z.string().regex(UUID_RE).nullable(), env: z.string(), paneId: z.string().regex(PANE_RE) }),
+      ]).optional(),
+    }).safeParse(body);
+    if (!parsed.success) {
+      // A non-object body yields an issue with path [] — "".join(".") is "", not undefined, so ?? never fires.
+      const path = parsed.error.issues[0]?.path.join(".") ?? "";
+      const field = path === "" ? "body" : path;
+      return c.json({ error: { code: "validation", message: `invalid "${field}"` } }, 400);
+    }
+
+    const targetEnv = opts.envs.find((e) => e.id === parsed.data.env);
+    if (targetEnv === undefined) return c.json({ error: { code: "validation", message: "unknown env" } }, 400);
+
+    // targetWorkspaceId is the only new client value that reaches herdr (`--workspace <id>`); guard it.
+    const rawTwid = parsed.data.targetWorkspaceId;
+    if (rawTwid !== null && rawTwid !== undefined && !WS_RE.test(rawTwid)) {
+      return c.json({ error: { code: "validation", message: "bad targetWorkspaceId" } }, 400);
+    }
+
+    const spawnedByInput = parsed.data.spawnedBy;
+    if (typeof spawnedByInput === "object" && opts.envs.find((e) => e.id === spawnedByInput.env) === undefined) {
+      return c.json({ error: { code: "validation", message: "unknown env in spawnedBy" } }, 400);
+    }
+
+    const board = opts.storage.getBoard(bid);
+    if (board === null) return c.json({ error: { code: "not_found" } }, 404);
+    const task = board.tasks.find((t) => t.id === tid);
+    if (task === undefined) return c.json({ error: { code: "not_found" } }, 404);
+
+    const allBoards = opts.storage.getAllBoards();
+    const assignedPaneIds = new Set<string>();
+    for (const b of allBoards) {
+      for (const t of b.tasks) {
+        for (const s of t.sessions) {
+          // Scoped to the TARGET environment. spawnSession compares this set against sessions listed
+          // from that environment alone, and two local environments are two independent herdr servers
+          // that both number panes from scratch — an unscoped set lets `w1:p1` over there mark `w1:p1`
+          // here as taken, so a retry after a timeout starts a second session instead of rejoining.
+          if (s.env === targetEnv.id) assignedPaneIds.add(s.paneId);
+        }
+      }
+    }
+
+    // Config lookup FIRST, on every branch: an unresolvable name refuses before any workspace is
+    // listed, so a client string can never select a workspace on its own and never reaches herdr as
+    // a path — only the trusted value behind the key does. `Object.hasOwn` so a repo named
+    // "__proto__"/"constructor" can't resolve an inherited value (a plain-object index would return
+    // Object.prototype, not undefined). spawnCommand likewise comes from the env config.
+    const newSpaceRepo = parsed.data.repo ?? null;
+    if (newSpaceRepo !== null && !Object.hasOwn(targetEnv.repos, newSpaceRepo)) {
+      // Its OWN code, deliberately not the blanket `validation` this route returns for every other
+      // bad field: corral_spawn re-renders exactly this case as "repository not configured — retry
+      // with one of…", and a tool keyed on `validation` would answer that to a bad model id.
+      return c.json({ error: { code: "unknown_repo", message: `no repository "${newSpaceRepo}" is configured for env ${targetEnv.id}` } }, 400);
+    }
+    const repoPath = newSpaceRepo !== null ? (targetEnv.repos[newSpaceRepo] ?? null) : null;
+    // The three-state read (see the schema comment). Absent is passed on ABSENT, never collapsed —
+    // that is the whole signal spawn.ts resolves a repo from.
+    const hasTarget = parsed.data.targetWorkspaceId !== undefined;
+    // Two of the four shapes carry no target at all: no key and no repo, and an explicit `null` with
+    // no repo — §1's table makes `repo` REQUIRED on the explicit-null row, because a new space has to
+    // be rooted somewhere. Refused here rather than left to fail inside the spawner, which reported a
+    // caller's malformed request as a 500 server fault.
+    if (newSpaceRepo === null && (!hasTarget || parsed.data.targetWorkspaceId === null)) {
+      return c.json({ error: { code: "validation", message: 'no spawn target: send "targetWorkspaceId" (a workspace id, or null together with a "repo" to create a new space) or "repo" on its own' } }, 400);
+    }
+
+    const slug = sanitizeSlug(task.title);
+    // One string for tab label, link name and `claude --name`. The requested name IS the name — corral
+    // no longer prefixes it with the card slug. The prefix below is consulted ONLY when nothing usable
+    // was supplied (the UI sends no name at all, and a name in a non-Latin script reduces to nothing).
+    //
+    // Uniqueness is CARD-scoped on purpose. Two cards holding the same name is not a fault: Claude
+    // runs sessions with identical names, and corral addresses a session by (env, paneId) with the
+    // card for context. Widening it board-wide bought nothing and cost a walk over every board.
+    //
+    // SLUGIFIED, because a stored link name is not always a string this route composed: attach and
+    // from-session take it as `z.string().default("")` from the client, so a card can hold
+    // "Fix the auth bug". Candidates are always slugified, so comparing against the raw form never
+    // matches and the `-2` suffix silently fails to fire. Only reachable since the requested name
+    // stopped being prefixed with the card slug — before that no candidate could equal a bare
+    // stored name's slug.
+    const usedNames = new Set(task.sessions.map((s) => slugify(s.name, NAME_MAX)));
+    const namePrefix = fallbackNamePrefix(task.title, newSpaceRepo, task.id);
+    const sessionName = composeSessionName(namePrefix, parsed.data.name ?? "", (n) => !usedNames.has(n), usedNames.size);
+    if (sessionName === null) {
+      // Type-required null guard only: composeSessionName tries `usedNames.size + 2` numbered
+      // candidates, which by pigeonhole always contains one that is free, so this branch is
+      // unreachable in practice.
+      return c.json({ error: { code: "name_unavailable", message: "no free session name left — choose a different name" } }, 409);
+    }
+    // Brief/start-command delivery: the `$(cat …)` substitution runs in the pane's own shell, so the
+    // file must exist on the TARGET machine — written locally, or streamed over ssh for a remote env.
+    // Order is schema → mutual exclusion → byte cap → write, so a refusal creates no file.
+    const brief = parsed.data.brief;
+    const startCommand = parsed.data.startCommand;
+    if (brief !== undefined && startCommand !== undefined) {
+      return c.json({ error: { code: "validation", message: "send either brief or startCommand, not both" } }, 400);
+    }
+    const firstMessage = brief !== undefined ? composeBrief(brief) : startCommand;
+    const messageKind = brief !== undefined ? "brief" : "startCommand";
+    let briefPath: string | undefined;
+    if (firstMessage !== undefined) {
+      if (briefByteLength(firstMessage) > BRIEF_MAX_BYTES) {
+        return c.json({ error: { code: "too_large", message: `brief exceeds ${String(BRIEF_MAX_BYTES)} bytes` } }, 413);
+      }
+      try {
+        briefPath = targetEnv.kind === "remote"
+          ? await writeRemote(targetEnv, { name: "brief.md", bytes: new TextEncoder().encode(firstMessage) })
+          : await writeBrief(briefRoot, firstMessage);
+      } catch (err) {
+        return c.json({ error: { code: "brief_write_failed", message: err instanceof Error ? err.message : String(err) } }, 500);
+      }
+      // Audit: coordinates and size only, never contents. `kind` matters — a spawn that hands a session
+      // an AUTO-EXECUTING command must not read the same in the log as a preamble-wrapped brief.
+      console.warn(`[brief] kind=${messageKind} board=${bid} task=${tid} env=${targetEnv.id} bytes=${String(briefByteLength(firstMessage))} path=${briefPath}`);
+    }
+    const spawnTimerHandle = { id: setTimeout(() => { /* replaced below */ }, 0) };
+    clearTimeout(spawnTimerHandle.id);
+    const spawnTimeoutPromise = new Promise<never>((_, rej) => {
+      spawnTimerHandle.id = setTimeout(() => { rej(new Error("spawn_timeout")); }, spawnTimeoutMs);
+    });
+    // Keep a handle to the spawn so a timeout can tear down whatever it eventually creates (below).
+    const spawnPromise = opts.spawn({
+      env: targetEnv, taskSlug: slug, sessionName,
+      cwd: task.sessions[0]?.cwdSnapshot ?? process.cwd(),
+      repo: newSpaceRepo, assignedPaneIds,
+      spawnCommand: targetEnv.spawnCommand,
+      ...(hasTarget ? { targetWorkspaceId: parsed.data.targetWorkspaceId ?? null } : {}),
+      repoPath,
+      ...(parsed.data.model === undefined ? {} : { model: parsed.data.model }),
+      // Absent === off. Never `remoteControl: parsed.data.remoteControl ?? false` — under
+      // exactOptionalPropertyTypes an explicit `false` and an absent key are different types, and
+      // spawn.ts branches on `=== true`.
+      ...(parsed.data.remoteControl === true ? { remoteControl: true } : {}),
+      ...(briefPath === undefined ? {} : { briefPath }),
+      ...(startCommand === undefined ? {} : { briefFallback: START_COMMAND_FALLBACK }),
+    });
+    // Unlink the brief once THIS spawn attempt is done — a brief's on-disk lifetime is one spawn, not
+    // one server run. Chained off `spawnPromise` itself (not the race below): a timed-out spawn keeps
+    // running in the background, and its eventual settlement — success or failure — is exactly when
+    // the launch command has been sent, so that is what must gate the delete, not the route's response.
+    // This is only the BACKSTOP: the launch command deletes the brief itself once it has read it
+    // (server/spawn.ts), so this fires on a pane that never ran the command. The delay is deliberate
+    // and generous; see config.ts BRIEF_CLEANUP_DELAY_MS.
+    // Local only: corral has no handle on a remote filesystem to unlink from. The launch command
+    // removes the remote brief file once it has read it; the empty private directory (and the file,
+    // if the pane never ran the command) is left to the remote OS's temp cleaning.
+    if (briefPath !== undefined && targetEnv.kind === "local") {
+      const bp = briefPath;
+      void spawnPromise.finally(() => {
+        setTimeout(() => { void cleanupBrief(bp); }, briefCleanupDelayMs).unref();
+      }).catch(() => undefined);
+    }
+    try {
+      const result = await Promise.race([spawnPromise, spawnTimeoutPromise]);
+      const liveSessionId = opts.poller.getSnapshot().sessions.find((s) => s.env === targetEnv.id && s.paneId === result.paneId)?.sessionId ?? null;
+      // A session value with a null sessionId (the spawner hadn't registered yet) is resolved by
+      // env+paneId against the live snapshot — a pane alone is not trustworthy (herdr reuses pane
+      // ids) — and dropped if that fails, rather than stored as a bare, unverifiable pane claim.
+      const spawnerSid = spawnedByInput === undefined || spawnedByInput === "operator"
+        ? null
+        : spawnedByInput.sessionId
+          ?? opts.poller.getSnapshot().sessions.find((s) => s.env === spawnedByInput.env && s.paneId === spawnedByInput.paneId)?.sessionId
+          ?? null;
+      const resolvedSpawnedBy: SessionLink["spawnedBy"] = spawnedByInput === "operator"
+        ? "operator"
+        : spawnedByInput === undefined || spawnerSid === null
+          ? undefined
+          : { sessionId: spawnerSid, env: spawnedByInput.env, paneId: spawnedByInput.paneId };
+      const link: SessionLink = {
+        env: targetEnv.id, paneId: result.paneId,
+        tabId: result.tabId, tabLabel: result.tabLabel,
+        workspaceId: result.workspaceId, workspaceLabel: result.workspaceLabel,
+        name: sessionName, cwdSnapshot: result.cwdSnapshot,
+        // Almost always null here — Claude hasn't registered on the fresh pane yet (it's absent from
+        // `agent list` until then). Not a bug: the reconciler backfills it once the poller sees the id.
+        sessionId: liveSessionId,
+        ...(resolvedSpawnedBy === undefined ? {} : { spawnedBy: resolvedSpawnedBy }),
+      };
+      // An idempotent spawn adopts a pane spawnSession found ALREADY live in the workspace (see
+      // spawn.ts's join-path rejoin scan) — that pane can already be linked on THIS card (e.g. a
+      // stale/renamed link whose pane moved, or a retried spawn). Appending unconditionally would put
+      // two links on the card resolving to the same live session, so this re-checks and writes in the
+      // SAME withBoard transaction — `task` above is a pre-spawn snapshot (spawn can run up to
+      // SPAWN_TIMEOUT_MS) and is stale by the time the write happens, exactly the gap /attach closes by
+      // doing its identical isSessionBound check inside its own withBoard callback.
+      const { link: responseLink, alreadyOnCard } = await opts.storage.withBoard(bid, (b) => {
+        if (b === null) return { board: null, result: { link, alreadyOnCard: false } };
+        const t = b.tasks.find((x) => x.id === tid);
+        if (t === undefined) return { board: b, result: { link, alreadyOnCard: false } };
+        const existing = t.sessions.find((s) => linkBindsSession(s, { env: targetEnv.id, paneId: result.paneId, liveSessionId }));
+        if (existing === undefined) {
+          // Stamp session_spawned only on a genuinely new session — the churn-heal and idempotent-adopt
+          // branches below re-point an existing link and are not a launch.
+          return {
+            board: { ...b, tasks: b.tasks.map((x) => x.id === tid
+              ? stampSystem({ ...x, sessions: [...x.sessions, link], updatedAt: nowSecs() }, "session_spawned", `spawned ${sessionRef(link)}`)
+              : x) },
+            result: { link, alreadyOnCard: false },
+          };
+        }
+        // Churn-heal: the match came via linkBindsSession's sessionId-only disjunct (the pane moved), so
+        // the existing link's location fields are stale — heal them from the fresh spawn/poller result
+        // rather than returning the pre-move pane.
+        const healed: SessionLink = {
+          ...existing, paneId: result.paneId, tabId: result.tabId, tabLabel: result.tabLabel,
+          workspaceId: result.workspaceId, workspaceLabel: result.workspaceLabel,
+          cwdSnapshot: result.cwdSnapshot, sessionId: liveSessionId ?? existing.sessionId,
+        };
+        if (healed.paneId === existing.paneId && healed.tabId === existing.tabId
+          && healed.workspaceId === existing.workspaceId && healed.sessionId === existing.sessionId) {
+          return { board: b, result: { link: existing, alreadyOnCard: true } };
+        }
+        return {
+          board: { ...b, tasks: b.tasks.map((x) => x.id === tid ? { ...x, sessions: x.sessions.map((s) => s === existing ? healed : s), updatedAt: nowSecs() } : x) },
+          result: { link: healed, alreadyOnCard: true },
+        };
+      });
+      return c.json({ ...responseLink, idempotent: result.idempotent || alreadyOnCard });
+    } catch (err) {
+      const timedOut = err instanceof Error && err.message === "spawn_timeout";
+      if (timedOut) {
+        // The abandoned spawn keeps running (it has no cancellation). When it finishes, tear down the
+        // orphaned session it created, else it surfaces unlinked in Unassigned. Skip an idempotent
+        // rejoin: it returns a PRE-EXISTING session's tab that this spawn did NOT create — closing it
+        // would kill a session the user never spawned.
+        void spawnPromise.then((r) => {
+          if (r.idempotent) return;
+          // pane close (not tab close): the orphan is a fresh single-tab workspace, and tab close
+          // refuses a workspace's last tab — pane close cascades and removes the whole workspace.
+          return closePaneFn(targetEnv, r.paneId);
+        }).catch(() => void 0);
+      }
+      const code = timedOut ? "spawn_timeout" : "spawn_error";
+      return c.json({ error: { code, message: err instanceof Error ? err.message : String(err), step: "spawn" } }, 500);
+    } finally {
+      clearTimeout(spawnTimerHandle.id);
+    }
+  });
+
+  app.post("/api/boards/:bid/tasks/:tid/move", async (c) => {
+    if (opts.storage === undefined) return c.json({ error: { code: "no_storage" } }, 503);
+    const storage = opts.storage;
+    const bid = c.req.param("bid");
+    if (!BID_RE.test(bid)) return c.json({ error: { code: "validation", message: "bad boardId" } }, 400);
+    const tid = c.req.param("tid");
+    if (!TID_RE.test(tid)) return c.json({ error: { code: "validation", message: "bad taskId" } }, 400);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return c.json({ error: { code: "validation", message: "invalid JSON" } }, 400); }
+    const parsed = MoveTaskRequestSchema.safeParse(body);
+    if (!parsed.success) return c.json({ error: { code: "validation", message: parsed.error.message } }, 400);
+    const toBoardId = parsed.data.toBoardId;
+    if (!BID_RE.test(toBoardId)) return c.json({ error: { code: "validation", message: "bad toBoardId" } }, 400);
+    if (toBoardId === bid) return c.json({ ok: true }); // no-op
+
+    // Lock BOTH boards together (canonical order → no deadlock): read the task FRESH from source under
+    // the combined lock (kills the lost-write where a concurrent spawn/attach on the source task was
+    // discarded), then add-to-target + remove-from-source both under the lock (kills the interleaving
+    // where the task briefly existed on both). `withBoards` writes boardA (the target, passed first)
+    // before boardB (the source) — both synchronous, so the only residual is a process crash between the
+    // two writes, which then yields a recoverable duplicate rather than a lost task.
+    type MoveOutcome = "ok" | "src_gone" | "task_gone" | "target_gone" | "target_no_columns" | "conflict";
+    const outcome = await storage.withBoards<MoveOutcome>(toBoardId, bid, (target, source) => {
+      if (source === null) return { boardA: target, boardB: source, result: "src_gone" };
+      if (target === null) return { boardA: target, boardB: source, result: "target_gone" };
+      const task = source.tasks.find((t) => t.id === tid);
+      if (task === undefined) return { boardA: target, boardB: source, result: "task_gone" };
+      if (target.tasks.some((t) => t.id === tid)) return { boardA: target, boardB: source, result: "conflict" };
+      // Map status: keep it if the target has that column, else the target's LANDING column.
+      let status = task.status;
+      if (!target.columns.some((col) => col.id === task.status)) {
+        const landing = defaultColumnId(target.columns);
+        if (landing === undefined) return { boardA: target, boardB: source, result: "target_no_columns" };
+        status = landing;
+      }
+      const moved: Task = { ...task, status, updatedAt: nowSecs() };
+      // A move that lands in a different column is a status change; a move that keeps the column is
+      // not. Columns and nothing more (§10) — the entry does not record the board hop, which the
+      // card's new home already makes plain.
+      const movedTask = status === task.status ? moved : stampSystem(moved, "status_changed", `${task.status} → ${status}`);
+      return {
+        boardA: { ...target, tasks: [...target.tasks, movedTask] },
+        boardB: { ...source, tasks: source.tasks.filter((t) => t.id !== tid) },
+        result: "ok",
+      };
+    });
+    if (outcome === "src_gone" || outcome === "task_gone" || outcome === "target_gone") {
+      return c.json({ error: { code: "not_found" } }, 404);
+    }
+    if (outcome === "target_no_columns") {
+      return c.json({ error: { code: "validation", message: "board has no columns" } }, 400);
+    }
+    if (outcome === "conflict") {
+      return c.json({ error: { code: "conflict", message: "task id already exists on target" } }, 409);
+    }
+    return c.json({ ok: true });
+  });
+
+  app.post("/api/boards/:bid/tasks/from-session", async (c) => {
+    if (opts.storage === undefined) return c.json({ error: { code: "no_storage" } }, 503);
+    const storage = opts.storage;
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return c.json({ error: { code: "validation", message: "invalid JSON" } }, 400); }
+    const parsed = FromSessionBodySchema.safeParse(body);
+    if (!parsed.success) return c.json({ error: { code: "validation", message: parsed.error.message } }, 400);
+    const bid = c.req.param("bid");
+    if (!BID_RE.test(bid)) return c.json({ error: { code: "validation", message: "bad boardId" } }, 400);
+    const { env, paneId } = parsed.data;
+    if (!opts.envs.find((e) => e.id === env)) {
+      return c.json({ error: { code: "validation", message: "unknown env" } }, 400);
+    }
+    if (!PANE_RE.test(paneId)) {
+      return c.json({ error: { code: "validation", message: "bad paneId" } }, 400);
+    }
+    const key = `${env}:${paneId}`;
+    const now = nowSecs();
+    // Capture the stable Claude UUID from the live snapshot at write time (from-session binds a session
+    // that IS live), so the new binding is churn-resolvable from the start; null if not yet registered.
+    const liveRow = opts.poller.getSnapshot().sessions.find((s) => `${s.env}:${s.paneId}` === key);
+
+    type FromSessionResult = "board_not_found" | "conflict" | "no_columns" | { ok: true; task: Task };
+    const result = await storage.withBoard<FromSessionResult>(bid, (existing) => {
+      if (existing === null) return { board: null, result: "board_not_found" };
+      // Claim-check: is THIS live session already bound anywhere? Uses the exact per-link complement
+      // of buildUnassigned (server/session-binding.ts) so a stale dead-UUID link on the same pane no longer
+      // false-conflicts a restarted session — the whole point of this fix.
+      const liveSessionId = liveRow?.sessionId ?? null;
+      const allLinks = storage.getAllBoards().flatMap((b) => b.tasks.flatMap((t) => t.sessions));
+      if (isSessionBound(allLinks, { env, paneId, liveSessionId })) {
+        return { board: existing, result: "conflict" as const };
+      }
+      const landing = parsed.data.status ?? defaultColumnId(existing.columns);
+      if (landing === undefined) return { board: existing, result: "no_columns" as const };
+      const link: SessionLink = {
+        env: parsed.data.env,
+        paneId: parsed.data.paneId,
+        // Prefer the live row's stable ids/cwd (from-session binds a LIVE session) so close/resume have
+        // real coordinates; the client's body values are a legacy fallback for a snapshot miss.
+        tabId: liveRow?.tabId ?? parsed.data.tabId,
+        tabLabel: parsed.data.tabLabel,
+        workspaceId: liveRow?.workspaceId ?? parsed.data.workspaceId,
+        workspaceLabel: parsed.data.workspaceLabel,
+        // Never store an empty name — a detached card renders "⚠ {name}", which would be a bare "⚠ ".
+        name: parsed.data.name !== "" ? parsed.data.name : parsed.data.paneId,
+        cwdSnapshot: liveRow !== undefined ? liveRow.cwd : parsed.data.cwdSnapshot,
+        sessionId: liveRow?.sessionId ?? null,
+      };
+      const base = {
+        id: generateTaskId(),
+        title: parsed.data.title,
+        description: parsed.data.description ?? "",
+        status: landing,
+        priority: parsed.data.priority ?? null,
+        sessions: [link],
+        log: [],
+        createdAt: now,
+        updatedAt: now,
+      };
+      // A card born with a session already on it: the `created` entry names that session, so a
+      // separate session_bound line for the same fact would be noise.
+      const newTask = stampSystem(base, "created", `created from session ${sessionRef(link)}`);
+      return { board: { ...existing, tasks: [...existing.tasks, newTask] }, result: { ok: true as const, task: newTask } };
+    });
+
+    if (result === "board_not_found") return c.json({ error: { code: "not_found" } }, 404);
+    if (result === "conflict") return c.json({ error: { code: "conflict", message: "session already assigned" } }, 409);
+    if (result === "no_columns") return c.json({ error: { code: "validation", message: "board has no columns" } }, 400);
+    const { log: _log, ...frame } = result.task;
+    return c.json(frame, 201);
+  });
+
+  return app;
+}

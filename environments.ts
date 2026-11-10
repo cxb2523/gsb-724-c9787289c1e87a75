@@ -1,0 +1,135 @@
+import { readFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { z } from "zod";
+
+import { ENV_CONFIG_PATH } from "./config.ts";
+
+const SafeToken = z.string().regex(/^[A-Za-z0-9~/._:@-]+$/, "must not contain spaces or shell metacharacters");
+
+// Stricter than SafeToken (no `:` `/` `~` `@`): the id is a URL path segment and the prefix of
+// `${env.id}:${paneId}` attention keys, which both server enrichment and client routing split on the
+// FIRST colon — a colon inside the id would silently land the split inside the id.
+const EnvIdToken = z.string().regex(/^[A-Za-z0-9._-]+$/, "env id must use only letters, digits, '.', '_', '-' (it is a URL segment and the 'env:paneId' key prefix)");
+
+// The tighter of the two OS sun_path limits (104 on macOS/BSD, 108 on Linux), with margin.
+const REMOTE_SOCKET_PATH_MAX = 100;
+
+const RemoteReposValue = SafeToken.refine((s) => !s.startsWith("~"), {
+  message: "remote repos paths must be absolute — ~ is not expanded on the remote shell",
+});
+
+const RawLocalEnvSchema = z.object({
+  id: EnvIdToken, label: z.string(), kind: z.literal("local"),
+  socket: SafeToken.optional(),
+  claudeConfigDirs: z.array(z.string()).optional(),
+  spawnCommand: SafeToken.optional(),
+  // `.min(1)` is load-bearing: an empty path is not null, so it survives every `?? null` fallback and
+  // reaches herdr as `workspace create --cwd ""`.
+  repos: z.record(z.string(), z.string().min(1, "a repo path must not be empty")).optional(),
+});
+const RawRemoteEnvSchema = z.object({
+  id: EnvIdToken, label: z.string(), kind: z.literal("remote"),
+  sshHost: SafeToken, socket: SafeToken, herdrBin: SafeToken,
+  // The only switch for the remote MCP tunnel; absent means no corral tools there (ADR 0009).
+  mcpSocket: SafeToken
+    .refine((s) => s.startsWith("/"), {
+      message: "mcpSocket must be an absolute path on the remote host — ~ is not expanded by sshd",
+    })
+    // `ssh -R <remote>:<local>` is colon-delimited.
+    .refine((s) => !s.includes(":"), { message: "mcpSocket must not contain ':' — it would split the ssh forward spec" })
+    .refine((s) => s.length <= REMOTE_SOCKET_PATH_MAX, {
+      message: `mcpSocket must be at most ${String(REMOTE_SOCKET_PATH_MAX)} characters — a unix-domain socket path is capped by the OS`,
+    })
+    .optional(),
+  claudeConfigDirs: z.array(
+    SafeToken.refine((s) => !s.startsWith("~"), {
+      message: "remote claudeConfigDirs must be absolute — ~ is not expanded on the remote shell",
+    })
+  ).optional(),
+  spawnCommand: SafeToken.optional(),
+  repos: z.record(z.string(), RemoteReposValue).optional(),
+});
+const RawHerdrEnvSchema = z.discriminatedUnion("kind", [RawLocalEnvSchema, RawRemoteEnvSchema]);
+type RawHerdrEnv = z.infer<typeof RawHerdrEnvSchema>;
+
+const EnvConfigSchema = z.object({ environments: z.array(RawHerdrEnvSchema).min(1) })
+  // This path decides which listener a session reaches, and that is its environment (ADR 0009).
+  .superRefine((cfg, ctx) => {
+    const seen = new Map<string, string>();
+    for (const env of cfg.environments) {
+      if (env.kind !== "remote" || env.mcpSocket === undefined) continue;
+      const other = seen.get(env.mcpSocket);
+      if (other !== undefined) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `environments "${other}" and "${env.id}" share one mcpSocket path — each remote environment needs its own, or their sessions resolve to the wrong environment's cards`,
+        });
+      }
+      seen.set(env.mcpSocket, env.id);
+    }
+  });
+
+export type HerdrEnv =
+  | { readonly id: string; readonly label: string; readonly kind: "local"; readonly socket?: string; readonly claudeConfigDirs: readonly string[]; readonly spawnCommand: string; readonly repos: Readonly<Record<string, string>> }
+  | { readonly id: string; readonly label: string; readonly kind: "remote"; readonly sshHost: string; readonly socket: string; readonly herdrBin: string; readonly mcpSocket?: string; readonly claudeConfigDirs: readonly string[]; readonly spawnCommand: string; readonly repos: Readonly<Record<string, string>> };
+
+const LOCAL_DEFAULT_DIRS = ["~/.claude"] as const;
+
+function expandDir(d: string): string {
+  const home = os.homedir();
+  if (d.startsWith("~/")) return path.join(home, d.slice(2));
+  if (d === "~") return home;
+  return d;
+}
+
+function expandRepos(repos: Record<string, string> | undefined, expand: boolean): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(repos ?? {})) out[k] = expand ? expandDir(v) : v;
+  return out;
+}
+
+function postProcess(raw: RawHerdrEnv): HerdrEnv {
+  const spawnCommand = raw.spawnCommand ?? "claude";
+  if (raw.kind === "local") {
+    const dirs: readonly string[] = (raw.claudeConfigDirs ?? LOCAL_DEFAULT_DIRS).map(expandDir);
+    const repos = expandRepos(raw.repos, true);
+    const base = { id: raw.id, label: raw.label, kind: "local" as const, claudeConfigDirs: dirs, spawnCommand, repos };
+    return raw.socket !== undefined ? { ...base, socket: raw.socket } : base;
+  }
+  const remote = {
+    id: raw.id, label: raw.label, kind: "remote" as const,
+    sshHost: raw.sshHost, socket: raw.socket, herdrBin: raw.herdrBin,
+    claudeConfigDirs: raw.claudeConfigDirs ?? [],
+    spawnCommand, repos: expandRepos(raw.repos, false),
+  };
+  // Spread-on-present: under exactOptionalPropertyTypes an explicit undefined is not an absent key.
+  return raw.mcpSocket === undefined ? remote : { ...remote, mcpSocket: raw.mcpSocket };
+}
+
+// Trusted operator config, loaded ONCE at startup — same trust level as source code (whoever runs
+// the server owns the file). NEVER mutate environments via the web API/UI: a runtime-set sshHost
+// would turn the server into an SSH relay (spec §4, §13). A local entry with no socket inherits
+// the ambient HERDR_SOCKET_PATH; the server warns at startup if it is unset.
+export function loadEnvironments(filePath: string = ENV_CONFIG_PATH): readonly HerdrEnv[] {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(filePath, "utf8"));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`cannot read environments config at ${filePath} (copy environments.example.json there): ${msg}`);
+  }
+  const result = EnvConfigSchema.safeParse(raw);
+  if (!result.success) {
+    throw new Error(`invalid environments config at ${filePath}: ${result.error.message}`);
+  }
+  return result.data.environments.map(postProcess);
+}
+
+export const ENVIRONMENTS: readonly HerdrEnv[] = loadEnvironments();
+
+export function getEnv(id: string): HerdrEnv {
+  const env = ENVIRONMENTS.find((e) => e.id === id);
+  if (!env) throw new Error(`unknown environment: ${id}`);
+  return env;
+}

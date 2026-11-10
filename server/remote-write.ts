@@ -1,0 +1,109 @@
+import { spawn } from "node:child_process";
+import { quote } from "shell-quote";
+
+import type { HerdrEnv } from "../environments.ts";
+import { SSH_NOISE } from "./herdr.ts";
+import { sshFlags } from "./ssh-flags.ts";
+
+type RemoteEnv = Extract<HerdrEnv, { readonly kind: "remote" }>;
+
+// mktemp -d plus umask 077 keep the file private to the remote user in a shared /tmp.
+const REMOTE_SCRIPT =
+  'umask 077; d=$(mktemp -d "${TMPDIR:-/tmp}/corral-upload.XXXXXX") || exit 1; ' +
+  'if cat > "$d/$1"; then printf %s "$d/$1"; else rm -rf "$d"; exit 1; fi';
+
+// ConnectTimeout does not apply to a client attaching to a running master, so the whole transfer needs its own bound.
+const BASE_TIMEOUT_MS = 30_000;
+const PER_MB_TIMEOUT_MS = 20_000;
+const MAX_CAPTURE_BYTES = 256 * 1024;
+const MAX_STDERR_CHARS = 64 * 1024;
+const REMOTE_PATH_RE = /^\/.+$/;
+
+export interface RemoteChild {
+  readonly stdin: { end(data: Uint8Array): unknown; on(event: "error", cb: () => void): unknown };
+  readonly stdout: { on(event: "data", cb: (chunk: Buffer) => void): unknown };
+  readonly stderr: { on(event: "data", cb: (chunk: Buffer) => void): unknown };
+  on(event: "error", cb: (err: Error) => void): unknown;
+  on(event: "close", cb: (code: number | null) => void): unknown;
+  kill(): unknown;
+}
+export type SpawnSsh = (file: string, args: readonly string[]) => RemoteChild;
+
+const defaultSpawn: SpawnSsh = (file, args) => spawn(file, [...args], { stdio: ["pipe", "pipe", "pipe"] });
+
+export function remoteWriteTimeoutMs(byteLength: number): number {
+  return BASE_TIMEOUT_MS + Math.ceil(byteLength / (1024 * 1024)) * PER_MB_TIMEOUT_MS;
+}
+
+export function runRemoteScript(
+  env: RemoteEnv,
+  opts: {
+    readonly script: string;
+    readonly args: readonly string[];
+    readonly stdin: Uint8Array;
+    readonly timeoutMs: number;
+    readonly what: string;
+    readonly spawnFn?: SpawnSsh;
+  },
+): Promise<string> {
+  const remoteCmd = quote(["sh", "-c", opts.script, "sh", ...opts.args]);
+  const child = (opts.spawnFn ?? defaultSpawn)("ssh", [...sshFlags(), env.sshHost, remoteCmd]);
+
+  return new Promise<string>((resolve, reject) => {
+    let settled = false;
+    // Decoded once on close: per-chunk decoding corrupts a multibyte character split across chunks.
+    const out: Buffer[] = [];
+    let outBytes = 0;
+    let stderr = "";
+    let overflow = false;
+    const timer = setTimeout(() => {
+      child.kill();
+      finish(new Error(`${opts.what} timed out after ${String(Math.round(opts.timeoutMs / 1000))}s`));
+    }, opts.timeoutMs);
+    timer.unref();
+    function finish(err: Error | null, value = ""): void {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (err === null) resolve(value); else reject(err);
+    }
+
+    child.stdout.on("data", (chunk) => {
+      outBytes += chunk.length;
+      if (outBytes > MAX_CAPTURE_BYTES) overflow = true; else out.push(chunk);
+    });
+    child.stderr.on("data", (chunk) => { if (stderr.length < MAX_STDERR_CHARS) stderr += chunk.toString("utf8"); });
+    // EPIPE when ssh exits before reading everything; the exit code below carries the real failure.
+    child.stdin.on("error", () => undefined);
+    child.on("error", (err) => { finish(new Error(`ssh failed to start: ${err.message}`, { cause: err })); });
+    child.on("close", (code) => {
+      if (code !== 0) {
+        const detail = stderr.replace(SSH_NOISE, "").trim().split("\n").pop() ?? "";
+        finish(new Error(`${opts.what} failed (ssh exit ${String(code)})${detail === "" ? "" : `: ${detail}`}`));
+      } else if (overflow) {
+        finish(new Error(`${opts.what} returned more output than expected`));
+      } else {
+        finish(null, Buffer.concat(out).toString("utf8").replace(SSH_NOISE, ""));
+      }
+    });
+    child.stdin.end(opts.stdin);
+  });
+}
+
+/** `name` must already be a safe basename (sanitizeUploadName); the caller owns the private dir's lifetime. */
+export async function writeRemoteFile(
+  env: RemoteEnv,
+  opts: { readonly name: string; readonly bytes: Uint8Array; readonly timeoutMs?: number; readonly spawnFn?: SpawnSsh },
+): Promise<string> {
+  const stdout = await runRemoteScript(env, {
+    script: REMOTE_SCRIPT,
+    args: [opts.name],
+    stdin: opts.bytes,
+    timeoutMs: opts.timeoutMs ?? remoteWriteTimeoutMs(opts.bytes.byteLength),
+    what: "remote write",
+    ...(opts.spawnFn === undefined ? {} : { spawnFn: opts.spawnFn }),
+  });
+  const out = stdout.trim().split("\n").pop() ?? "";
+  if (!REMOTE_PATH_RE.test(out)) throw new Error("remote write returned no usable path");
+  return out;
+}
