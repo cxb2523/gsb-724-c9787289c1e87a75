@@ -1,8 +1,8 @@
 import net from "node:net";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { HerdrEnv } from "../environments.ts";
-import { startEnvListener } from "../server/remote-mcp/listener.ts";
+import { startEnvListener, type ListenerClock } from "../server/remote-mcp/listener.ts";
 import type { PinnedDeps } from "../server/remote-mcp/pinned-client.ts";
 
 // test/setup.ts points CORRAL_HOME at a temp dir, so these never touch a real corral home.
@@ -168,5 +168,134 @@ describe("remote MCP listener", () => {
       await new Promise<void>((r) => sock.once("close", () => { r(); }));
     }
     expect(true).toBe(true);
+  });
+});
+
+describe("remote MCP listener hardening", () => {
+  const PREAMBLE = JSON.stringify({ v: 1, paneId: "w1:p1", cwd: "/repo" });
+
+  async function handshake(sock: net.Socket, timeoutMs = 4000): Promise<unknown> {
+    await new Promise<void>((r) => sock.once("connect", () => { r(); }));
+    sock.write(`${PREAMBLE}\n${JSON.stringify(INIT)}\n`);
+    return collect(sock, (m) => hasResultId(m, 1), timeoutMs);
+  }
+
+  function spyOnErrors(): { errors: string[]; restore: () => void } {
+    const errors: string[] = [];
+    const spy = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      errors.push(args.map(String).join(" "));
+    });
+    return { errors, restore: () => { spy.mockRestore(); } };
+  }
+
+  it("handshakes normally when custom limits and a clock are injected", async () => {
+    const listener = await startEnvListener(deps, "http://127.0.0.1:1", {
+      clock: {
+        setTimeout: (cb) => { void cb; return () => undefined; },
+      },
+      preambleTimeoutMs: 60_000,
+      preambleMaxBytes: 1024,
+      maxConnections: 4,
+    });
+    started.push(listener);
+    const sock = net.createConnection(listener.socketPath);
+    const reply = await handshake(sock);
+    expect(reply).toBeDefined();
+    sock.destroy();
+  });
+
+  it("rejects connections past maxConnections instead of letting them hang", async () => {
+    const listener = await startEnvListener(deps, "http://127.0.0.1:1", { maxConnections: 1 });
+    started.push(listener);
+    const { errors, restore } = spyOnErrors();
+    try {
+      const first = net.createConnection(listener.socketPath);
+      await handshake(first);
+
+      const second = net.createConnection(listener.socketPath);
+      second.on("error", () => undefined); // the reset is the point; don't let it throw
+      await new Promise<void>((r) => second.once("close", () => { r(); }));
+      expect(second.destroyed).toBe(true);
+
+      // Distinct from the "dropping connection — preamble ..." wording of a bad preamble.
+      expect(errors.some((m) => m.includes("rejecting connection") && m.includes("connection limit"))).toBe(true);
+      expect(errors.some((m) => m.includes("preamble"))).toBe(false);
+      first.destroy();
+    } finally {
+      restore();
+    }
+  });
+
+  it("serves a good connection after one was rejected over the limit", async () => {
+    const listener = await startEnvListener(deps, "http://127.0.0.1:1", { maxConnections: 1 });
+    started.push(listener);
+
+    const first = net.createConnection(listener.socketPath);
+    await handshake(first);
+
+    const second = net.createConnection(listener.socketPath);
+    second.on("error", () => undefined);
+    await new Promise<void>((r) => second.once("close", () => { r(); }));
+    expect(second.destroyed).toBe(true);
+
+    first.destroy();
+    // The server-side slot frees asynchronously; retry until the listener counts it as gone.
+    let reply: unknown;
+    for (let attempt = 0; attempt < 20 && reply === undefined; attempt++) {
+      const sock = net.createConnection(listener.socketPath);
+      sock.on("error", () => undefined);
+      try {
+        reply = await handshake(sock, 300);
+      } catch {
+        sock.destroy();
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    }
+    expect(reply).toBeDefined();
+  });
+
+  it("drops a slow preamble when the injected clock fires the deadline", async () => {
+    let fire: (() => void) | undefined;
+    const clock: ListenerClock = {
+      setTimeout: (cb) => { fire = cb; return () => { fire = undefined; }; },
+    };
+    const listener = await startEnvListener(deps, "http://127.0.0.1:1", {
+      clock,
+      preambleTimeoutMs: 60_000, // never reached for real; the test fires the clock itself
+    });
+    started.push(listener);
+    const { errors, restore } = spyOnErrors();
+    try {
+      const sock = net.createConnection(listener.socketPath);
+      await new Promise<void>((r) => sock.once("connect", () => { r(); }));
+      sock.write('{"v":1'); // a partial preamble, so the drop is logged rather than silent
+      // Let the server's data handler run before the clock fires, or sawBytes is still false.
+      await new Promise((r) => setTimeout(r, 50));
+      for (let i = 0; i < 100 && fire === undefined; i++) await new Promise((r) => setTimeout(r, 5));
+      expect(fire).toBeDefined();
+
+      fire!();
+      await new Promise<void>((r) => sock.once("close", () => { r(); }));
+      expect(sock.destroyed).toBe(true);
+      expect(errors.some((m) => m.includes("no preamble within the deadline"))).toBe(true);
+    } finally {
+      restore();
+    }
+  });
+
+  it("enforces an injected preamble size limit", async () => {
+    const listener = await startEnvListener(deps, "http://127.0.0.1:1", { preambleMaxBytes: 16 });
+    started.push(listener);
+    const { errors, restore } = spyOnErrors();
+    try {
+      const sock = net.createConnection(listener.socketPath);
+      await new Promise<void>((r) => sock.once("connect", () => { r(); }));
+      sock.write("x".repeat(20)); // over 16 bytes, no newline
+      await new Promise<void>((r) => sock.once("close", () => { r(); }));
+      expect(sock.destroyed).toBe(true);
+      expect(errors.some((m) => m.includes("preamble exceeded its size limit"))).toBe(true);
+    } finally {
+      restore();
+    }
   });
 });

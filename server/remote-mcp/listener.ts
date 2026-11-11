@@ -22,12 +22,40 @@ export function localSocketPath(envId: string): string {
   return path.join(MCP_SOCKET_DIR, `${envId}.sock`);
 }
 
-const PREAMBLE_TIMEOUT_MS = 15_000;
+export const PREAMBLE_TIMEOUT_MS = 15_000;
 // Far above honest load (one connection per session); it bounds fd use against a looping peer.
-const MAX_CONNECTIONS = 64;
+export const MAX_CONNECTIONS = 64;
+
+// Injectable so tests can fire the preamble deadline deterministically instead of waiting 15s.
+export interface ListenerClock {
+  // Returns a cancel function; the real clock also unrefs so a pending preamble never holds the process.
+  setTimeout(callback: () => void, ms: number): () => void;
+}
+
+export interface ListenerOptions {
+  readonly clock?: ListenerClock;
+  readonly preambleTimeoutMs?: number;
+  readonly preambleMaxBytes?: number;
+  readonly maxConnections?: number;
+}
+
+interface ResolvedListenerOptions {
+  readonly clock: ListenerClock;
+  readonly preambleTimeoutMs: number;
+  readonly preambleMaxBytes: number;
+  readonly maxConnections: number;
+}
+
+const systemClock: ListenerClock = {
+  setTimeout: (callback, ms) => {
+    const timer = setTimeout(callback, ms);
+    timer.unref();
+    return () => { clearTimeout(timer); };
+  },
+};
 
 // One MCP server per connection, its environment fixed by which listener accepted it (ADR 0009).
-function serveConnection(conn: net.Socket, deps: PinnedDeps, baseUrl: string): void {
+function serveConnection(conn: net.Socket, deps: PinnedDeps, baseUrl: string, opts: ResolvedListenerOptions): void {
   let buf = Buffer.alloc(0);
   let started = false;
 
@@ -37,13 +65,12 @@ function serveConnection(conn: net.Socket, deps: PinnedDeps, baseUrl: string): v
   };
 
   let sawBytes = false;
-  const timer = setTimeout(() => {
+  const cancelTimer = opts.clock.setTimeout(() => {
     if (started) return;
     // Silent when nothing was said at all: corral's own tunnel probe connects and hangs up each tick.
     if (sawBytes) fail("no preamble within the deadline");
     else conn.destroy();
-  }, PREAMBLE_TIMEOUT_MS);
-  timer.unref();
+  }, opts.preambleTimeoutMs);
 
   const start = (line: string, rest: Buffer): void => {
     const parsed = parsePreamble(line);
@@ -98,14 +125,14 @@ function serveConnection(conn: net.Socket, deps: PinnedDeps, baseUrl: string): v
     buf = Buffer.concat([buf, chunk]);
     const nl = buf.indexOf(0x0a);
     if (nl === -1) {
-      if (buf.length > PREAMBLE_MAX_BYTES) fail("preamble exceeded its size limit with no newline");
+      if (buf.length > opts.preambleMaxBytes) fail("preamble exceeded its size limit with no newline");
       return;
     }
     // Both synchronous and inside the handler, so no chunk is read twice or dropped in between.
     conn.off("data", onData);
     conn.pause();
     started = true;
-    clearTimeout(timer);
+    cancelTimer();
     start(buf.subarray(0, nl).toString("utf8"), buf.subarray(nl + 1));
   };
 
@@ -123,7 +150,18 @@ export interface RemoteMcpListener {
 }
 
 // Unlinks first: a corral that was killed leaves its socket file behind and the bind would EADDRINUSE.
-export async function startEnvListener(deps: PinnedDeps, baseUrl: string): Promise<RemoteMcpListener> {
+export async function startEnvListener(
+  deps: PinnedDeps,
+  baseUrl: string,
+  options: ListenerOptions = {},
+): Promise<RemoteMcpListener> {
+  const opts: ResolvedListenerOptions = {
+    clock: options.clock ?? systemClock,
+    preambleTimeoutMs: options.preambleTimeoutMs ?? PREAMBLE_TIMEOUT_MS,
+    preambleMaxBytes: options.preambleMaxBytes ?? PREAMBLE_MAX_BYTES,
+    maxConnections: options.maxConnections ?? MAX_CONNECTIONS,
+  };
+
   mkdirSync(MCP_SOCKET_DIR, { recursive: true, mode: 0o700 });
   chmodSync(MCP_SOCKET_DIR, 0o700); // mkdir's mode goes through the umask
 
@@ -131,13 +169,20 @@ export async function startEnvListener(deps: PinnedDeps, baseUrl: string): Promi
   rmSync(socketPath, { force: true });
 
   const server = net.createServer();
-  server.maxConnections = MAX_CONNECTIONS;
+  server.maxConnections = opts.maxConnections;
   // close() only stops accepting; these connections are long-lived, so it would never settle.
   const live = new Set<net.Socket>();
   server.on("connection", (conn) => {
     live.add(conn);
     conn.on("close", () => live.delete(conn));
-    serveConnection(conn, deps, baseUrl);
+    serveConnection(conn, deps, baseUrl, opts);
+  });
+  // Past maxConnections node closes the socket itself and emits "drop" instead of "connection",
+  // so the peer gets an explicit close rather than hanging — and nothing enters the live set.
+  server.on("drop", () => {
+    console.error(
+      `[remote-mcp] ${deps.env.id}: rejecting connection — connection limit of ${String(opts.maxConnections)} reached`,
+    );
   });
   server.on("error", (err) => {
     console.error(`[remote-mcp] ${deps.env.id}: listener error — ${err.message}`);
